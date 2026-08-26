@@ -1,0 +1,482 @@
+Metadata-Version: 2.4
+Name: scail2-inference
+Version: 0.1.3
+Summary: Persistent BF16 SCAIL-2 inference engine and distributed worker runtime
+License: Apache-2.0
+Requires-Python: <3.11,>=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: accelerate<1.15,>=1.14
+Requires-Dist: decord==0.6.0
+Requires-Dist: diffusers<0.40,>=0.39
+Requires-Dist: easydict<2,>=1.13
+Requires-Dist: einops<0.9,>=0.8
+Requires-Dist: ftfy<7,>=6.3
+Requires-Dist: imageio<3,>=2.37
+Requires-Dist: imageio-ffmpeg<0.7,>=0.6
+Requires-Dist: numpy<2,>=1.26
+Requires-Dist: Pillow<12,>=11
+Requires-Dist: safetensors<0.9,>=0.8
+Requires-Dist: sentencepiece<0.3,>=0.2
+Requires-Dist: tokenizers<0.23,>=0.22
+Requires-Dist: tqdm<5,>=4.68
+Requires-Dist: transformers<5.14,>=5.13
+Dynamic: license-file
+
+ <h1>SCAIL-2: Unifying Controlled Character Animation with End-to-end In-Context Conditioning</h1>
+
+
+ <div align="center">
+  <a href="https://arxiv.org/abs/2606.10804">
+    <img src="https://img.shields.io/badge/arXiv-2606.10804-red" alt="arXiv">
+  </a>
+  <a href="https://huggingface.co/zai-org/SCAIL-2">
+    <img src="https://img.shields.io/badge/%F0%9F%A4%97%20HuggingFace-SCAIL--2-yellow" alt="HuggingFace">
+  </a>
+  <a href="https://teal024.github.io/SCAIL-2/">
+    <img src="https://img.shields.io/badge/Project%20Page-SCAIL--2-green" alt="Project Page">
+  </a>
+  <a href="#datasets">
+    <img src="https://img.shields.io/badge/Datasets-MotionPair-blue" alt="Datasets">
+  </a>
+</div>
+
+
+
+This repository contains the official implementation code of SCAIL-2: Unifying Controlled Character Animation with End-to-end In-Context Conditioning. The code is for the inference of SCAIL-2 Model, an open-source model to support **End-to-End** Character Animation. 
+
+
+<p align="center">
+  <img src='resources/teaser.png' alt='Teaser' width='90%'>
+</p>
+
+## 📰 News
+- **2026.07.15**: 🔥 [Relighting LoRA](https://huggingface.co/zai-org/SCAIL-2/blob/main/model/relighting-lora.pt) for replacement mode released!
+- **2026.06.17**: 🎉 Multi-reference support landed in [ComfyUI](https://github.com/Comfy-Org/ComfyUI/pull/14509).
+- **2026.06.13**: 🎉 [Multi-reference inference](#experimental-functions-multi-reference) released.
+- **2026.06.09**: 🎉 [ComfyUI](https://github.com/Comfy-Org/ComfyUI/pull/14373) integration now available.
+- **2026.06.09**: 🎉 [Model](https://huggingface.co/zai-org/SCAIL-2) & inference code open-sourced.
+
+## 📋 TODO
+- [ ] Open-source training code on [`sat-scail2`](https://github.com/zai-org/SCAIL-2/tree/sat-scail2) branch
+
+## 🔎 Introduction
+SCAIL-1 identifies the key bottlenecks that hinder character animation towards production level: how to represent the pose and how to inject the pose. However, the reliance on intermediate pose representation still hinders the model towards complex motion and generalizable identity. We define the issue as over reliance on intermediates.
+
+As intermediates, skeleton maps suffer from inherent ambiguity under complex scenarios. Further, it restricts the driving source to be exocentric human movements and thus cannot handle driving sources like animals. Character replacement and multi-character animation suffers from similar issues, where state-of-the-art methods use inpainting masks, but such masks are still a form of intermediates and limits the application and bounds the performance.
+
+
+<p align="center">
+  <img src='resources/preteaser.png' alt='preteaser' width='50%'>
+</p>
+
+
+
+To bypass intermediate pose representation, we utilize several off-the-shelf models, including [SCAIL-Preview](https://github.com/zai-org/SCAIL), [Wan-Animate](https://github.com/Wan-Video/Wan2.2), [MoCha](https://github.com/Orange-3DV-Team/MoCha) to synthesize 60K motion pairs. By designing a Unified Motion Transfer Interface containing 2 type of masking channels and a dedicated RoPE design, we support training with all those data. We utilize **reserve driving**, so that the model can learn capabilities beyond those models. From the data composition and the training recipe, the final model yield emergent capabilities. For example, it supports cross-identity replacement, animal-driving scenarios, and support more advanced control intermediate like [SAM3D-Body](https://github.com/facebookresearch/sam-3d-body)'s mesh rendering in zero-shot manner.
+
+<p align="center">
+  <img src='resources/pipeline.png' alt='pipeline' width='90%'>
+</p>
+
+<p align="center">
+  <img src='resources/network.png' alt='Teaser' width='90%'>
+</p>
+
+We model the bias of pose-driven generators as preference and introduce Bias-Aware DPO, a novel mechanisim to further improve details. The DPO LoRA is also released at HuggingFace and can be enabled in this repo as well as ComfyUI implementations.
+
+
+## 🎨 Community Works
+
+❤️ We thank the community for sharing their amazing creations! Special thanks to Ablejones (Discord), 机智波, 肥猴, 绘篇AI手艺 (Bilibili), Fuzzy-Mastodon (Reddit). Audio comes from reference videos.
+
+<table align="center" width="100%">
+  <tr>
+    <td width="27%"><video src="https://github.com/user-attachments/assets/76380c62-abdf-4149-82d7-feccaa3a380d" controls width="100%"></video></td>
+    <td width="27%"><video src="https://github.com/user-attachments/assets/80d37479-63ed-45f5-8c93-7d3598b6275d" controls width="100%"></video></td>
+    <td width="45%"><video src="https://github.com/user-attachments/assets/39d07740-5089-4d54-843e-e6311c1639f3" controls width="100%"></video></td>
+  </tr>
+  <tr>
+    <td width="50%" colspan="2"><video src="https://github.com/user-attachments/assets/9f8083c7-60af-4735-98d2-7dcfcccbab76" controls width="100%"></video></td>
+    <td width="40%" colspan="1"><video src="https://github.com/user-attachments/assets/9fb9d894-1030-448f-a3f7-71022f359ccb" controls width="100%"></video></td>
+  </tr>
+</table>
+
+
+## 🚀 Getting Started
+
+
+### Mask Semantics
+The mask is a critical input to SCAIL-2 even in Animation Mode. To visualize the channels that the mask is actually for, we encode them with colors:
+
+- **Black** — tells the model the background at this location should *not* be visible.
+- **White** — tells the model the background at this location *should* be visible.
+- **Color** — encodes the correspondence between character regions and the driving motion.
+
+Animation mode (end-to-end) example (left: reference mask, right: driving mask):
+
+<p align="center">
+  <img src='examples/animation_001/combined.gif' alt='animation mask example' width='60%'>
+</p>
+
+<p align="center">
+  <img src='resources/multi_combination.gif' alt='multi animation mask example' width='60%'>
+</p>
+
+
+Animation mode (pose-driven) example (left: reference mask, right: driving mask):
+
+<p align="center">
+  <img src='examples/animation_001_posedriven/combined.gif' alt='pose-driven animation mask example' width='60%'>
+</p>
+
+Replacement mode example (left: reference mask, right: driving mask):
+
+<p align="center">
+  <img src='examples/replace_001/combined.gif' alt='replacement mask example' width='60%'>
+</p>
+
+Without a correct mask Animation mode collapse into Replacement-Mode behavior in certain inputs. 
+
+The masks also enable zero-shot multi-reference generation, where additional visual inputs provide information that single reference may not cover, such as back view, close-up view and occluded background. According to the color assignment logic, in multi-reference the following inputs get the corresponding masks as shown below:
+
+<table>
+  <tr>
+    <td align="center"><img src="examples/animation_003_multi_ref/character_0.png" width="150"/></td>
+    <td align="center"><img src="examples/animation_003_multi_ref/character_1.png" width="150"/></td>
+    <td align="center"><img src="examples/animation_003_multi_ref/background.png" width="150"/></td>
+    <td align="center"><img src="examples/animation_003_multi_ref/ref.png" width="150"/></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="examples/animation_003_multi_ref/character_0_mask.png" width="150"/></td>
+    <td align="center"><img src="examples/animation_003_multi_ref/character_1_mask.png" width="150"/></td>
+    <td align="center"><img src="examples/animation_003_multi_ref/background_mask.png" width="150"/></td>
+    <td align="center"><img src="examples/animation_003_multi_ref/ref_mask.jpg" width="150"/></td>
+  </tr>
+</table>
+
+
+### Checkpoints Download
+
+| ckpts       | Download Link                                                                                                                |    Notes                      |
+|--------------|------------------------------------------------------------------------------------------------------------------------------|-------------------------------|
+| SCAIL-2 | [🤗 Hugging Face](https://huggingface.co/zai-org/SCAIL-2) <br> [🤖 ModelScope](https://modelscope.cn/models/ZhipuAI/SCAIL-2) | Trained with mixed resolutions and fps. <br> End-to-end driven supports both 512p and 704p. <br> Pose-driven performs better under 704p.  <br> H and W should be both divisible by 32<br> (e.g. 704*1280) if using other resolutions. |
+
+Use the following commands to download the model weights
+(We have integrated both Wan VAE and T5 modules into this checkpoint for convenience).
+
+```bash
+hf download zai-org/SCAIL-2
+```
+The files should be organized like:
+```
+SCAIL-2/
+├── Wan2.1_VAE.pth
+├── model
+│   ├── 1
+│   │   └── fsdp2_rank_0000_checkpoint.pt
+│   └── latest
+└── umt5-xxl
+    ├── ...
+```
+
+The model weights are intended for `sat`  branch, for usage in `wan` branch, convert to `safetensors` format: 
+```bash
+python convert.py --scail-dir /path/to/SCAIL-2 --save-path /path/to/SCAIL-2.safetensors
+```
+
+### Environment Setup
+Please make sure your Python version is between 3.10 and 3.12, inclusive of both 3.10 and 3.12.
+```
+pip install -r requirements.txt
+```
+
+
+
+
+### Input Preparation
+
+`SCAIL-Pose` contains the preprocessing code used to prepare SCAIL-2 inputs, including pose extraction, pose rendering, reference masks, and driving-video masks. It can prepare both animation inputs and character replacement inputs. The submodule should live under the project root:
+
+```
+SCAIL-2/
+├── generate.py
+├── examples/
+├── SCAIL-Pose/
+└── ...
+```
+
+After cloning this repository, initialize the submodule:
+
+```bash
+git submodule update --init --recursive
+```
+
+Enter the submodule and follow its environment setup. `SCAIL-Pose` recommends an OpenMMLab/MMPose environment, then installing its own requirements:
+
+```bash
+cd SCAIL-Pose
+pip install -r requirements.txt
+```
+
+Download the pose-preprocessing weights inside `SCAIL-Pose/pretrained_weights`. The required layout is:
+
+```
+pretrained_weights/
+├── nlf_l_multi_0.3.2.torchscript
+└── DWPose/
+    ├── dw-ll_ucoco_384.onnx
+    └── yolox_l.onnx
+```
+
+For SCAIL-2 animation, `SCAIL-Pose` provides an all-in-one preprocessing entrypoint:
+
+```bash
+# Recommended end-to-end mode: rendered_v2.mp4 is the driving video copy,
+# and the mask video is generated from SAM3 masks.
+python NLFPoseExtract/process_animation_aio.py --subdir /path/to/input --e2e_mode
+
+# Pose-driven mode: runs NLF + DWPose and writes a skeleton render.
+python NLFPoseExtract/process_animation_aio.py --subdir /path/to/input
+```
+
+For character replacement, use:
+
+```bash
+python NLFPoseExtract/process_replacement.py --subdir /path/to/input
+
+# If the driving video has multiple people and only one should be replaced:
+python NLFPoseExtract/process_replacement.py --subdir /path/to/input --matchnearest
+```
+
+The preprocessing outputs are written back to the example folder and can be passed to `generate.py` as `--image`, `--mask_image`, `--pose`, and `--mask_video`.
+
+
+## 🦾 Usage
+### Generate Input Conditions
+
+`generate.py` runs one SCAIL-2 inference job from four local input files:
+
+```
+examples/001/
+├── ref.jpg                 # reference character image
+├── ref_mask.jpg            # foreground mask of the reference image
+├── rendered_v2.mp4         # driving / pose video consumed by --pose
+└── rendered_mask_v2.mp4    # per-frame driving mask consumed by --mask_video
+```
+
+The paths passed to `--image`, `--mask_image`, `--pose`, and `--mask_video` must exist. The script checks them before loading the image/video data.
+
+For animation mode, `--pose` can be an end-to-end driving video or a pose-rendered video, depending on how the sample was prepared. `--mask_video` should be the corresponding per-frame foreground/control mask. For replacement mode, pass `--replace_flag` and provide the replacement-region mask through `--mask_video`.
+
+### Prompt Semantics
+
+For both animation and character replacement, `--prompt` should describe the generated video itself. It should not be an instruction to the model.
+
+For replacement tasks, the prompt should describe the video after replacement has already happened. For better results, describe the replacement character's visible clothing and appearance, and include objects the character interacts with or stays close to in the video, such as tools, instruments, chairs, tables, vehicles, doors, or handheld items.
+
+### Character Replacement Prompt Enhancer
+
+We provide an optional Gemini-based helper, `prompt_enhancer.py`, to turn a short replacement instruction into a positive prompt for `generate.py`. The helper samples frames from the source video, reads the replacement reference image, uses few-shot examples from `prompt_examples.txt`, and outputs a long English description of the replaced video.
+
+`google-genai` is not installed by default in `requirements.txt`. Install it before using the enhancer:
+
+```bash
+pip install google-genai
+```
+
+Set a Gemini API key before running. 
+
+```bash
+export GEMINI_API_KEY=your_api_key
+```
+
+Example:
+
+```bash
+python prompt_enhancer.py \
+    --video /path/to/driving.mp4 \
+    --image /path/to/ref.png \
+    --instruction "replace the man in the blue jacket in the video with the person in the image" \
+    --examples prompt_examples.txt \
+    --num_frames 8 \
+    --output enhanced_prompt.txt \
+    --caption_out source_caption.txt
+```
+
+The `--instruction` argument is only for Gemini, so it can say who should be replaced by whom. The file written to `--output` is the positive generated-video description that should be passed to `generate.py --prompt`; the enhancer is instructed to include useful SCAIL-2 prompt details such as the replacement character's clothing and objects the character interacts with.
+
+Use the enhanced prompt for replacement inference:
+
+```bash
+python generate.py \
+    --model SCAIL-14B \
+    --ckpt_dir /path/to/SCAIL-2 \
+    --scail_path /path/to/SCAIL-2.safetensors \
+    --replace_flag \
+    --target_w 896 --target_h 512 \
+    --image /path/to/ref.png \
+    --mask_image /path/to/ref_mask.png \
+    --pose /path/to/driving.mp4 \
+    --mask_video /path/to/replace_mask.mp4 \
+    --prompt "$(cat enhanced_prompt.txt)" \
+    --save_file replacement_output.mp4
+```
+
+`prompt_examples.txt` is used as few-shot style guidance. Add more examples there if you want the enhanced prompts to follow a different level of detail or wording.
+
+### Single-GPU Inference
+
+Run inference directly with `generate.py`:
+
+Example for animation:
+
+```bash
+python generate.py \
+    --model SCAIL-14B \
+    --ckpt_dir /path/to/SCAIL-2 \
+    --scail_path /path/to/SCAIL-2.safetensors \
+    --target_w 896 --target_h 512 \
+    --image examples/001/ref.jpg \
+    --mask_image examples/001/ref_mask.jpg \
+    --pose examples/001/rendered_v2.mp4 \
+    --mask_video examples/001/rendered_mask_v2.mp4 \
+    --prompt "The girl is dancing" \
+    --save_file output.mp4
+```
+
+Example for replacement:
+
+```bash
+python generate.py \
+    --model SCAIL-14B \
+    --ckpt_dir /path/to/SCAIL-2 \
+    --scail_path /path/to/SCAIL-2.safetensors \
+    --target_w 896 --target_h 512 \
+    --image examples/replace_001/ref.png \
+    --mask_image examples/replace_001/ref_mask.png \
+    --pose examples/replace_001/rendered_v2.mp4 \
+    --mask_video examples/replace_001/replace_mask.mp4 \
+    --prompt "A blond white male wearing a black suit, trousers, and leather shoes is playing the violin on the street while pedestrians walk past him." \
+    --save_file output.mp4 \
+    --replace_flag
+```
+
+Useful sampling options:
+
+- `--sample_steps`: number of denoising steps. Defaults to `40`.
+- `--sample_shift`: flow-matching scheduler shift. Defaults to `3.0` if not specified.
+- `--sample_guide_scale`: classifier-free guidance scale. Defaults to `5.0`.
+- `--sample_solver`: `unipc` or `dpm++`. Defaults to `unipc`.
+- `--offload_model`: whether to offload model components between stages. For single-process inference, the default is `True`.
+
+Note that SCAIL-2 is trained with long, detailed prompts. Short prompts or an empty prompt can run, but detailed descriptions of the reference subject and motion usually produce better results.
+
+
+### LoRA Integrations
+
+If you use a Lightx2v LoRA checkpoint, pass it with `--lora_path` and set its strength with `--lora_alpha`:
+
+```bash
+python generate.py \
+    --model SCAIL-14B \
+    --ckpt_dir /path/to/SCAIL-2 \
+    --scail_path /path/to/SCAIL-2.safetensors \
+    --lora_path Lightx2v/lightx2v_I2V_14B_480p_cfg_step_distill_rank128_bf16.safetensors \
+    --lora_alpha 1.0 \
+    --sample_steps 8 \
+    --sample_shift 1 \
+    --sample_guide_scale 1.0 \
+    --target_w 896 --target_h 512 \
+    --image examples/001/ref.jpg \
+    --mask_image examples/001/ref_mask.jpg \
+    --pose examples/001/rendered_v2.mp4 \
+    --mask_video examples/001/rendered_mask_v2.mp4 \
+    --prompt "The girl is dancing" \
+    --save_file output.mp4
+```
+
+For the DPO LoRA, you can checkout the [`sat-scail2`](https://github.com/zai-org/SCAIL-2/tree/sat-scail2) branch to fully reproduce original results, or convert it into this branch after format matching. The DPO LoRA does not only alleviate hands distortion, but also improved the synchronization of the lips and eyes. If you use ComfyUI, here is a brief comparison showing the effect of the DPO LoRA in Kijai's ComfyUI Workflow:
+
+
+<p align="center"><video src="https://github.com/user-attachments/assets/bfaf6ea8-6190-4b92-a002-2bfc2b523544" controls width="90%"></video></p>
+
+
+
+
+
+
+### Relighting LoRA
+
+Relighting LoRA is designed for **replacement mode** and improves replacement quality by making the reference character blend more naturally into the target video with consistent lighting and shadows.
+
+Download the SAT format from [🤗 Hugging Face](https://huggingface.co/zai-org/SCAIL-2/blob/main/model/relighting-lora.pt) and convert to safetensors format to use it in wan branch:
+
+```bash
+python convert_lora.py --input /path/to/relighting-lora.pt --output /path/to/relighting_lora.safetensors
+```
+
+Then use it with `--lora_path` and `--replace_flag` as described in [LoRA Integrations](#lora-integrations) above.
+
+### Experimental Functions: Multi-Reference
+
+SCAIL-2 supports zero-shot multi-reference inference though not optimized for it. Extra references are optional images that provide additional visual evidence, such as another view of the character, a close-up of clothing details, or a clean background reference. Pass them with `--additional_ref_image` and pass one mask for each image with `--additional_ref_mask_image`. The two lists must have the same length and are paired position by position.
+
+Choose each extra-reference mask according to the mask semantics described above:
+- For a clean background reference whose visible background should be preserved, use a **white** mask over the valid background area. If the background is not occluded by the character, a full-white mask is usually appropriate.
+- For extra character references where the background is different from the target scene, keep the character/control region in the semantic mask color and make the unrelated background **black**, so the model does not treat that background as visible target content.
+- Use consistent mask colors for the same character or region across the main reference, extra references, and driving mask when you want them to refer to the same subject.
+The following code provides a simple example of multi-reference inference:
+
+
+```bash
+python generate.py \
+    --model SCAIL-14B \
+    --ckpt_dir /path/to/SCAIL-2 \
+    --scail_path /path/to/SCAIL-2.safetensors \
+    --target_w 896 --target_h 512 \
+    --image examples/animation_003_multi_ref/ref.png \
+    --mask_image examples/animation_003_multi_ref/ref_mask.jpg \
+    --pose examples/animation_003_multi_ref/rendered_v2.mp4 \
+    --mask_video examples/animation_003_multi_ref/rendered_mask_v2.mp4 \
+    --additional_ref_image \
+        examples/animation_003_multi_ref/background.png \
+        examples/animation_003_multi_ref/character_1.png \
+        examples/animation_003_multi_ref/character_0.png \
+    --additional_ref_mask_image \
+        examples/animation_003_multi_ref/background_mask.png \
+        examples/animation_003_multi_ref/character_1_mask.png \
+        examples/animation_003_multi_ref/character_0_mask.png \
+    --prompt "An anime style character with yellow hair, wearing a white and green sailor uniform and a green skirt, is dancing in a warm anime-style classroom." \
+    --save_file output_multi_ref.mp4
+```
+
+However, as the model is not optimized for such inputs, video qualities may degrade even though additional information do get referenced. To address this, mocking those reference images as videos reduce degradation and artifacts. We specially thanks [wuwukasi](https://github.com/wuwukaka) and [iceage](https://github.com/user2318) for the collaboration to provide empircal results and implementations to support the findings. Check their refined implementations here: [WanAnimatePlus](https://github.com/wuwukaka/ComfyUI-WanAnimatePlus) and [CustomNodeKit](https://github.com/user2318/ComfyUI-CustomNodeKit/), where they will provide their workflows for SCAIL-2's multi-ref mode.
+
+
+<a id="datasets"></a>
+
+## 🗃️ Datasets
+We provide a large subset of the **MotionPair** dataset used to train SCAIL-2. To request access, please [fill out this form](https://docs.google.com/forms/d/e/1FAIpQLSfZjC0fZmiYFYHg90_79Yl45ipQLfR8ZhOAahOs19nO8nMvxA/viewform?usp=sharing&ouid=108574921907991336711) and agree to the terms of use. If you have not received a reply within a week after submitting the form, feel free to follow up at teal024@foxmail.com.
+
+
+## ✨ Acknowledgements
+Our implementation is built upon the foundation of [Wan 2.1](https://github.com/Wan-Video/Wan2.1) and the overall project architecture is inherited from [SCAIL](https://github.com/zai-org/SCAIL). We specially thank [Wan-Animate](https://github.com/Wan-Video/Wan2.2), [MoCha](https://github.com/Orange-3DV-Team/MoCha) as supplement data generators besides SCAIL to make MotionPair-60K. We also thank [HuMo Dataset](https://github.com/Phantom-video/HuMo) as the high-quality source video provider.
+
+## 📄 Citation
+
+If you find this work useful in your research, please cite:
+
+```bibtex
+@misc{yan2026scail2,
+      title={SCAIL-2: Unifying Controlled Character Animation with End-to-end In-Context Conditioning}, 
+      author={Wenhao Yan and Fengjia Guo and Zhuoyi Yang and Jie Tang},
+      year={2026},
+      eprint={2606.10804},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2606.10804}, 
+}
+```
+
+## 🗝️ License
+This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.

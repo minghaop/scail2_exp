@@ -1,0 +1,14 @@
+{
+  "name": "scail2-512p-bf16-v1",
+  "model": "SCAIL-14B",
+  "resident_dtype": "bf16",
+  "target_width": 512,
+  "target_height": 896,
+  "sample_solver": "euler",
+  "sample_steps": 6,
+  "sample_shift": 5.0,
+  "guide_scale": 1.0,
+  "seed": 42,
+  "segment_len": 81,
+  "segment_overlap": 1
+}

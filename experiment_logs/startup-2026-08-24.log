@@ -1,0 +1,62 @@
+# Normalized excerpt copied from the original container startup log.
+# Source command: podman logs iis_devgen_2_3
+
+W0824 08:15:36.208000 1 torch/distributed/run.py:766] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default.
+SCAIL2_INIT rank=1 local_rank=1 world_size=2 stage=engine_load status=start
+SCAIL2_INIT rank=0 local_rank=0 world_size=2 stage=engine_load status=start
+SCAIL2_INIT rank=1 local_rank=1 world_size=2 stage=process_group status=start
+SCAIL2_INIT rank=0 local_rank=0 world_size=2 stage=process_group status=start
+NCCL version 2.26.2+cuda12.2
+SCAIL2_INIT rank=1 local_rank=1 world_size=2 stage=process_group status=complete elapsed_seconds=4.417
+SCAIL2_INIT rank=1 local_rank=1 world_size=2 stage=pipeline_load status=start
+SCAIL2_INIT rank=0 local_rank=0 world_size=2 stage=process_group status=complete elapsed_seconds=4.473
+SCAIL2_INIT rank=0 local_rank=0 world_size=2 stage=pipeline_load status=start
+2026-08-24 08:15:44,125 INFO MainThread Validated SCAIL header: 1307 tensors, 1307 floating tensors, 16395544384 parameters, dtypes={'BF16': 1307}
+2026-08-24 08:15:44,261 INFO scail2-runtime Validated SCAIL header: 1307 tensors, 1307 floating tensors, 16395544384 parameters, dtypes={'BF16': 1307}
+2026-08-24 08:16:44,763 INFO MainThread loading /models/umt5-xxl/models_t5_umt5-xxl-enc-bf16.pth
+2026-08-24 08:16:45,905 INFO scail2-runtime loading /models/umt5-xxl/models_t5_umt5-xxl-enc-bf16.pth
+2026-08-24 08:16:55,166 INFO scail2-runtime loading /models/Wan2.1_VAE.pth
+2026-08-24 08:16:55,177 INFO MainThread loading /models/Wan2.1_VAE.pth
+2026-08-24 08:16:55,526 INFO scail2-runtime loading /models/models_clip_open-clip-xlm-roberta-large-vit-huge-14-onlyvisual.pth
+2026-08-24 08:16:55,555 INFO MainThread loading /models/models_clip_open-clip-xlm-roberta-large-vit-huge-14-onlyvisual.pth
+2026-08-24 08:16:57,117 INFO scail2-runtime Creating WanSCAILModel from /models/derived/SCAIL-2-lightx2v-r128-dpo-alpha1-full-bf16.safetensors with bf16 resident parameters
+2026-08-24 08:16:57,184 INFO MainThread Creating WanSCAILModel from /models/derived/SCAIL-2-lightx2v-r128-dpo-alpha1-full-bf16.safetensors with bf16 resident parameters
+SCAIL2_INIT rank=0 stage=dit_checkpoint_copy status=start
+SCAIL2_INIT rank=1 stage=dit_checkpoint_copy status=start
+2026-08-24 08:21:07,947 INFO MainThread Validated SCAIL checkpoint: 1307 floating tensors, 16395544384 parameters, 30.539 GiB tensor storage, dtype=bf16
+2026-08-24 08:21:07,948 INFO scail2-runtime Validated SCAIL checkpoint: 1307 floating tensors, 16395544384 parameters, 30.539 GiB tensor storage, dtype=bf16
+SCAIL2_INIT rank=1 stage=dit_checkpoint_copy status=complete elapsed_seconds=63.280
+SCAIL2_INIT rank=1 stage=pre_fsdp_barrier status=start
+SCAIL2_INIT rank=0 stage=dit_checkpoint_copy status=complete elapsed_seconds=90.937
+SCAIL2_INIT rank=0 stage=pre_fsdp_barrier status=start
+SCAIL2_INIT rank=0 stage=pre_fsdp_barrier status=complete elapsed_seconds=0.230
+SCAIL2_INIT rank=0 stage=dit_fsdp_wrap status=start sync_module_states=True
+SCAIL2_INIT rank=1 stage=pre_fsdp_barrier status=complete elapsed_seconds=12.371
+SCAIL2_INIT rank=1 stage=dit_fsdp_wrap status=start sync_module_states=True
+SCAIL2_INIT rank=1 stage=dit_fsdp_wrap status=complete elapsed_seconds=10.403 sync_module_states=True
+SCAIL2_INIT rank=1 local_rank=1 world_size=2 stage=pipeline_load status=complete elapsed_seconds=357.878
+SCAIL2_INIT rank=1 local_rank=1 world_size=2 stage=post_load_barrier status=start
+SCAIL2_INIT rank=0 stage=dit_fsdp_wrap status=complete elapsed_seconds=10.459 sync_module_states=True
+SCAIL2_INIT rank=0 local_rank=0 world_size=2 stage=pipeline_load status=complete elapsed_seconds=357.878
+SCAIL2_INIT rank=0 local_rank=0 world_size=2 stage=post_load_barrier status=start
+SCAIL2_INIT rank=1 local_rank=1 world_size=2 stage=post_load_barrier status=complete elapsed_seconds=0.056
+SCAIL2_INIT rank=1 local_rank=1 world_size=2 stage=engine_load status=complete elapsed_seconds=362.352
+SCAIL2_INIT rank=1 local_rank=1 world_size=2 stage=device_synchronize status=start
+SCAIL2_INIT rank=0 local_rank=0 world_size=2 stage=post_load_barrier status=complete elapsed_seconds=0.000
+SCAIL2_INIT rank=0 local_rank=0 world_size=2 stage=engine_load status=complete elapsed_seconds=362.351
+SCAIL2_INIT rank=0 local_rank=0 world_size=2 stage=device_synchronize status=start
+SCAIL2_INIT rank=1 local_rank=1 world_size=2 stage=device_synchronize status=complete elapsed_seconds=0.000
+SCAIL2_INIT rank=1 local_rank=1 world_size=2 stage=ready_barrier status=start
+SCAIL2_INIT rank=0 local_rank=0 world_size=2 stage=device_synchronize status=complete elapsed_seconds=0.001
+SCAIL2_INIT rank=0 local_rank=0 world_size=2 stage=ready_barrier status=start
+SCAIL2_INIT rank=1 local_rank=1 world_size=2 stage=ready_barrier status=complete elapsed_seconds=0.001
+SCAIL2_INIT rank=1 local_rank=1 world_size=2 stage=warmup status=complete elapsed_seconds=0.001
+SCAIL2_INIT rank=0 local_rank=0 world_size=2 stage=ready_barrier status=complete elapsed_seconds=0.000
+SCAIL2_INIT rank=0 local_rank=0 world_size=2 stage=warmup status=complete elapsed_seconds=0.001
+SCAIL2_WORKER_READY rank=0 world_size=2 profile=scail2-512p-bf16-v1 resident_dtype=bf16
+SCAIL2_CONTROL rank=1 backend=gloo status=ready heartbeat_seconds=1
+SCAIL2_CONTROL rank=0 backend=gloo status=ready heartbeat_seconds=1
+SCAIL2_DISPATCHER_WORKER_READY rank=0 host=0.0.0.0 port=3000 workflow=scail2_video
+INFO:     Started server process [625]
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:3000

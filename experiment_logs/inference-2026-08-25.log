@@ -1,0 +1,36 @@
+# Normalized excerpt copied from one 339-frame inference run.
+
+2026-08-25 09:46:21,904 INFO scail2-runtime SCAIL2_POSTPROCESS job_id=39a4606e1b0640b18aefdea5849ede51 stage=audio_mux status=start source=/dev/shm/625/driving_video.mp4
+2026-08-25 09:46:24,556 INFO scail2-runtime SCAIL2_POSTPROCESS job_id=39a4606e1b0640b18aefdea5849ede51 stage=audio_mux status=complete elapsed_seconds=2.652
+2026-08-25 09:46:37,891 INFO scail2-runtime Input prompt: A photorealistic video of the adult person shown in the reference image performing natural expressive body and hand movements. Preserve the exact facial identity, facial proportions, eyes, mouth, hairstyle, clothing, accessories, body proportions, lighting, background, and camera framing throughout. Stable detailed face, realistic skin, natural hands and limbs, coherent motion, consistent appearance, consistent lighting, steady camera, high detail.
+2026-08-25 09:46:37,891 INFO MainThread Input prompt: A photorealistic video of the adult person shown in the reference image performing natural expressive body and hand movements. Preserve the exact facial identity, facial proportions, eyes, mouth, hairstyle, clothing, accessories, body proportions, lighting, background, and camera framing throughout. Stable detailed face, realistic skin, natural hands and limbs, coherent motion, consistent appearance, consistent lighting, steady camera, high detail.
+2026-08-25 09:46:39,140 INFO MainThread Mode: Animation
+2026-08-25 09:46:39,140 INFO MainThread Generating video ...
+2026-08-25 09:46:39,140 INFO MainThread Sampling 5 segments with segment_len=81, segment_overlap=1.
+2026-08-25 09:46:39,160 INFO scail2-runtime Mode: Animation
+2026-08-25 09:46:39,160 INFO scail2-runtime Generating video ...
+2026-08-25 09:46:39,161 INFO scail2-runtime Sampling 5 segments with segment_len=81, segment_overlap=1.
+2026-08-25 09:46:39,459 INFO scail2-runtime Processing segment 1/5: frames [0, 81), padded_length=81
+2026-08-25 09:46:39,460 INFO MainThread Processing segment 1/5: frames [0, 81), padded_length=81
+# Both ranks: 6/6 steps in about 01:43, 17.23-17.24 seconds/step.
+2026-08-25 09:48:32,797 INFO MainThread Processing segment 2/5: frames [80, 161), padded_length=81
+2026-08-25 09:48:32,812 INFO scail2-runtime Processing segment 2/5: frames [80, 161), padded_length=81
+2026-08-25 09:48:34,194 INFO MainThread Using 1 clean history frames (1 latent frames).
+2026-08-25 09:48:34,281 INFO scail2-runtime Using 1 clean history frames (1 latent frames).
+# Both ranks: 6/6 steps in about 01:43, 17.23-17.24 seconds/step.
+2026-08-25 09:50:26,164 INFO MainThread Processing segment 3/5: frames [160, 241), padded_length=81
+2026-08-25 09:50:26,180 INFO scail2-runtime Processing segment 3/5: frames [160, 241), padded_length=81
+2026-08-25 09:50:27,551 INFO MainThread Using 1 clean history frames (1 latent frames).
+2026-08-25 09:50:27,608 INFO scail2-runtime Using 1 clean history frames (1 latent frames).
+# Both ranks: 6/6 steps in about 01:44, 17.36-17.37 seconds/step.
+2026-08-25 09:52:20,184 INFO MainThread Processing segment 4/5: frames [240, 321), padded_length=81
+2026-08-25 09:52:20,200 INFO scail2-runtime Processing segment 4/5: frames [240, 321), padded_length=81
+2026-08-25 09:52:21,562 INFO MainThread Using 1 clean history frames (1 latent frames).
+2026-08-25 09:52:21,701 INFO scail2-runtime Using 1 clean history frames (1 latent frames).
+# Both ranks: 6/6 steps in about 01:44, 17.34-17.36 seconds/step.
+2026-08-25 09:54:14,090 INFO MainThread Processing segment 5/5: frames [320, 339), padded_length=21
+2026-08-25 09:54:14,104 INFO scail2-runtime Processing segment 5/5: frames [320, 339), padded_length=21
+2026-08-25 09:54:14,435 INFO MainThread Using 1 clean history frames (1 latent frames).
+2026-08-25 09:54:14,465 INFO scail2-runtime Using 1 clean history frames (1 latent frames).
+# Both ranks: 6/6 steps in about 00:21, 3.51 seconds/step.
+2026-08-25 09:54:38,801 INFO scail2-runtime Saving generated video to /dev/shm/625/.b054e1590e9541ed8b4160ab501905c5.inprogress-625.mp4

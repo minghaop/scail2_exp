@@ -1,0 +1,4 @@
+generate
+scail2_inference
+scail2_segments
+wan

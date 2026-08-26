@@ -1,0 +1,2 @@
+[console_scripts]
+scail2-runtime-info = scail2_inference.environment:main
