@@ -249,6 +249,7 @@ class Scail2InferenceEngine:
             dit_resident_dtype=self.config.profile.resident_dtype,
             dit_meta_load=self.config.dit_meta_load,
             t5_meta_load=self.config.t5_meta_load,
+            precomputed_conditioning=self.config.precomputed_conditioning,
         )
         return pipeline, cfg, identity
 
@@ -352,6 +353,11 @@ class Scail2InferenceEngine:
             driving_mask=job.driving_mask.resolve(strict=True),
             prompt=job.prompt.strip(),
             output_path=job.output_path.resolve(),
+            conditioning_path=(
+                None
+                if job.conditioning_path is None
+                else job.conditioning_path.resolve(strict=True)
+            ),
             output_fps_fraction=fps_fraction,
             expected_output_frames=frames,
             expected_output_duration=duration,
@@ -379,6 +385,49 @@ class Scail2InferenceEngine:
     ) -> None:
         """Call the legacy, byte-verified generation adapter."""
         from generate import generate_video
+
+        conditioning = None
+        if self.config.precomputed_conditioning:
+            if job.conditioning_path is None:
+                raise InputValidationError(
+                    f"Job {job.job_id} requires a conditioning artifact"
+                )
+            from .conditioning import expected_metadata, load_conditioning
+
+            conditioning_started = time.monotonic()
+            t5_checkpoint = self.config.checkpoint_dir / self._cfg.t5_checkpoint
+            clip_checkpoint = self.config.checkpoint_dir / self._cfg.clip_checkpoint
+            expected = expected_metadata(
+                prompt=job.prompt,
+                negative_prompt="",
+                reference_image=job.reference_image,
+                target_width=self.config.profile.target_width,
+                target_height=self.config.profile.target_height,
+                t5_checkpoint=t5_checkpoint,
+                clip_checkpoint=clip_checkpoint,
+            )
+            try:
+                conditioning = load_conditioning(job.conditioning_path, expected)
+            except Exception as error:
+                raise InputValidationError(
+                    f"Job {job.job_id} conditioning validation failed: {error}"
+                ) from error
+            logging.info(
+                "SCAIL2_CONDITIONING job_id=%s status=loaded path=%s "
+                "elapsed_seconds=%.3f text_shape=%s negative_shape=%s "
+                "clip_shape=%s",
+                job.job_id,
+                job.conditioning_path,
+                time.monotonic() - conditioning_started,
+                tuple(conditioning["text_context"].shape),
+                tuple(conditioning["negative_context"].shape),
+                tuple(conditioning["clip_context"].shape),
+            )
+        elif job.conditioning_path is not None:
+            raise InputValidationError(
+                f"Job {job.job_id} supplied conditioning_path, but the engine "
+                "was not configured for precomputed conditioning"
+            )
 
         profile = self.config.profile
         args = SimpleNamespace(
@@ -413,6 +462,7 @@ class Scail2InferenceEngine:
             {},
             output_fps=float(Fraction(job.output_fps_fraction or "")),
             output_fps_fraction=job.output_fps_fraction,
+            conditioning=conditioning,
         )
 
     def infer(self, job: InferenceJob) -> InferenceResult:

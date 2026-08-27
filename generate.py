@@ -265,7 +265,7 @@ def _check_input_path(path, name):
         raise FileNotFoundError(f"{name} is not a file: {path}")
 
 
-def generate_video(pipeline: wan.SCAIL2Pipeline, prompt: str, image_path: str, image_mask_path: str, pose_path: str, driving_mask_path: str, args, device, rank, cfg, input_idx, replace_flag, additional_task_input=None, output_fps=None, output_fps_fraction=None):
+def generate_video(pipeline: wan.SCAIL2Pipeline, prompt: str, image_path: str, image_mask_path: str, pose_path: str, driving_mask_path: str, args, device, rank, cfg, input_idx, replace_flag, additional_task_input=None, output_fps=None, output_fps_fraction=None, conditioning=None):
     _check_input_path(image_path, "input image")
     _check_input_path(image_mask_path, "input mask image")
     _check_input_path(pose_path, "input pose video")
@@ -353,6 +353,7 @@ def generate_video(pipeline: wan.SCAIL2Pipeline, prompt: str, image_path: str, i
         guide_scale=args.sample_guide_scale,
         seed=args.base_seed,
         offload_model=args.offload_model,
+        conditioning=conditioning,
         **additional_input
     )
 

@@ -2,3 +2,4 @@ __pycache__/
 *.py[cod]
 experiment_logs/
 experiment_outputs/
+experiment_cache/

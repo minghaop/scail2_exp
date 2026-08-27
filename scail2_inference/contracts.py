@@ -111,6 +111,7 @@ class EngineConfig:
     t5_meta_load: bool = False
     dit_fsdp: bool = True
     dit_meta_load: bool = False
+    precomputed_conditioning: bool = False
     t5_cpu: bool = False
     offload_model: bool = False
     output_audio_mode: str = "none"
@@ -125,6 +126,10 @@ class EngineConfig:
             )
         if self.t5_cpu and self.t5_fsdp:
             raise EnvironmentValidationError("t5_cpu and t5_fsdp are mutually exclusive")
+        if self.precomputed_conditioning and self.t5_fsdp:
+            raise EnvironmentValidationError(
+                "precomputed_conditioning requires t5_fsdp=False"
+            )
         if self.offload_model:
             raise EnvironmentValidationError(
                 "The persistent worker contract requires offload_model=False"
@@ -196,6 +201,7 @@ class InferenceJob:
     driving_mask: Path
     prompt: str
     output_path: Path
+    conditioning_path: Path | None = None
     output_fps_fraction: str | None = None
     expected_output_frames: int | None = None
     expected_output_duration: float | None = None
@@ -247,6 +253,13 @@ class InferenceJob:
                     raise InputValidationError(
                         f"Job {self.job_id} has invalid {label}: {candidate}"
                     )
+            if self.conditioning_path is not None:
+                candidate = Path(self.conditioning_path)
+                if not candidate.is_file() or candidate.stat().st_size == 0:
+                    raise InputValidationError(
+                        f"Job {self.job_id} has invalid conditioning artifact: "
+                        f"{candidate}"
+                    )
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -258,6 +271,11 @@ class InferenceJob:
             "output_path",
         ):
             payload[field_name] = str(payload[field_name])
+        payload["conditioning_path"] = (
+            None
+            if payload["conditioning_path"] is None
+            else str(payload["conditioning_path"])
+        )
         payload["metadata"] = dict(self.metadata)
         return payload
 
@@ -272,6 +290,8 @@ class InferenceJob:
             "output_path",
         ):
             values[field_name] = Path(values[field_name])
+        if values.get("conditioning_path") is not None:
+            values["conditioning_path"] = Path(values["conditioning_path"])
         return cls(**values)
 
 

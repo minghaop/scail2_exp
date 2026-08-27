@@ -451,3 +451,15 @@ wan/distributed/fsdp.py，以及 experiment_logs 下的两份日志。
 - `ffprobe` 验证输出包含 H.264 视频和 AAC 音频：512x896、30 fps、297 帧、9.9 秒、19587416 bytes。输出规格和此前 legacy-standard+expandable 成功基线完全一致。
 - 日志中没有 AMP `FutureWarning`、OOM、traceback、NCCL error 或 timeout。退出清理阶段仍有已知的 FSDP `PyInterpreter.cpp` weak-reference warning，但不影响结果保存和正常退出。
 - 结束后包括 GPU 2、3 在内的全部 GPU 均为 0 MiB、0% utilization，无实验残留进程。该回归确认 T5/DiT meta-assign 加载优化与 expandable allocator 可以共同完成端到端推理，加载优化本身不会导致此前的 step 3 停顿。
+
+## 29. T5/CLIP 独立预处理与主流程摘除实验（2026-08-27）
+
+- 新增 `prepare_conditioning.py`，在单张物理 GPU 2 上顺序执行 T5 prompt encoding 和 CLIP reference-image encoding，不加载 VAE 或 DiT。输出使用版本化 safetensors 缓存；当前固定样例为 `experiment_cache/conditioning/101.safetensors`，大小 1420832 bytes。
+- 缓存严格绑定 prompt、negative prompt、参考图 SHA-256、目标尺寸，以及 T5/CLIP checkpoint 的路径、大小和 mtime；主推理加载时校验全部元数据和 tensor 契约。三个 tensor 分别为：`text_context=[92,4096]` BF16、`negative_context=[1,4096]` BF16、`clip_context=[1,257,1280]` FP16。
+- 预处理日志：`experiment_logs/conditioning/101-20260827-172426.log`。T5 阶段 3.598 秒、GPU peak allocated 11088.6 MiB；CLIP 阶段 2.170 秒、GPU peak allocated 2491.2 MiB；包含模型加载、两次编码、顺序释放和缓存保存的进程总耗时 12.5 秒。
+- `EngineConfig.precomputed_conditioning=True` 时要求 `t5_fsdp=False`；Pipeline 构造阶段完全跳过 T5 和 CLIP，generate 阶段只接收已验证的三组 CPU tensor 并移动到当前 rank 的 GPU。未提供缓存、缓存身份不匹配或 tensor dtype/shape 不匹配都会直接失败。
+- init-only 日志：`experiment_logs/fsdp_baseline/101-20260827-172514.log`。两个 rank 均跳过 T5/CLIP 并成功完成 VAE、DiT meta-assign、FSDP wrap 和 ready；`engine_load=13.537` 秒，相比包含 T5/CLIP 的 17.862 秒减少 4.325 秒（24.2%）。
+- 完整推理日志：`experiment_logs/fsdp_baseline/101-20260827-172549.log`；输出：`experiment_outputs/fsdp_baseline/101-20260827-172549.mp4`。`engine_load=13.771` 秒，四个 segment、每段 6 步全部完成，进程 exit code 0，无 OOM、NCCL timeout、traceback 或 AMP FutureWarning。
+- 缓存主流程的 ready-to-finished 推理请求耗时为 436.904 秒；原在线 T5/CLIP 流程为 437.707 秒，减少 0.803 秒（0.18%），扩散采样单步速度不变。预处理的主要收益不是单次 DiT 计算加速，而是让主 worker 不再加载/常驻 T5 和 CLIP，并允许缓存跨任务复用。
+- 新旧两次完整输出的 SHA-256 完全相同：`7039c5f231eb64b544c4aa288ea5107411c9e7f51bdcf4c93d125d6e1610680a`。这比仅比较媒体规格更强，确认当前固定 seed、prompt、参考图和输入下，独立预处理没有引入任何输出字节差异。
+- 若把 12.5 秒预处理成本计入只使用一次的任务，总时间不会更快；该结构的价值来自离线/异步预处理、相同 prompt/reference 的复用，以及为单卡主 worker 释放模型显存。`experiment_cache/` 已加入 `.gitignore`。

@@ -258,6 +258,7 @@ class SCAIL2Pipeline:
         dit_resident_dtype="fp32",
         dit_meta_load=False,
         t5_meta_load=False,
+        precomputed_conditioning=False,
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -292,6 +293,9 @@ class SCAIL2Pipeline:
             t5_meta_load (`bool`, *optional*, defaults to False):
                 Build T5 on the meta device and directly assign an mmap-backed
                 weights-only checkpoint before FSDP wrapping.
+            precomputed_conditioning (`bool`, *optional*, defaults to False):
+                Skip T5 and CLIP construction. Every generation call must then
+                provide validated precomputed text and visual conditioning.
         """
         self.device = torch.device(f"cuda:{device_id}")
         self.config = config
@@ -316,6 +320,11 @@ class SCAIL2Pipeline:
         )
         self.dit_meta_load = bool(dit_meta_load)
         self.t5_meta_load = bool(t5_meta_load)
+        self.precomputed_conditioning = bool(precomputed_conditioning)
+        if self.precomputed_conditioning and t5_fsdp:
+            raise ValueError(
+                "precomputed_conditioning requires t5_fsdp=False"
+            )
         if self.dit_resident_dtype == torch.bfloat16 and self.lora_path is not None:
             raise ValueError(
                 "Runtime LoRA fusion is disabled for BF16-resident SCAIL. "
@@ -353,34 +362,44 @@ class SCAIL2Pipeline:
         self.param_dtype = config.param_dtype
 
         shard_fn = partial(shard_model, device_id=device_id)
-        t5_checkpoint_path = os.path.join(
-            checkpoint_dir, config.t5_checkpoint
-        )
-        t5_started = time.monotonic()
-        _emit_pipeline_init_event(
-            self.rank,
-            "t5_load",
-            "start",
-            checkpoint_bytes=os.path.getsize(t5_checkpoint_path),
-            fsdp=t5_fsdp,
-        )
-        self.text_encoder = T5EncoderModel(
-            text_len=config.text_len,
-            dtype=config.t5_dtype,
-            device=torch.device('cpu'),
-            checkpoint_path=t5_checkpoint_path,
-            tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
-            shard_fn=shard_fn if t5_fsdp else None,
-            meta_load=self.t5_meta_load,
-            init_event=partial(_emit_pipeline_init_event, self.rank),
-        )
-        _emit_pipeline_init_event(
-            self.rank,
-            "t5_load",
-            "complete",
-            started_at=t5_started,
-            fsdp=t5_fsdp,
-        )
+        self.text_encoder = None
+        if self.precomputed_conditioning:
+            _emit_pipeline_init_event(
+                self.rank,
+                "t5_load",
+                "complete",
+                started_at=time.monotonic(),
+                skipped=True,
+            )
+        else:
+            t5_checkpoint_path = os.path.join(
+                checkpoint_dir, config.t5_checkpoint
+            )
+            t5_started = time.monotonic()
+            _emit_pipeline_init_event(
+                self.rank,
+                "t5_load",
+                "start",
+                checkpoint_bytes=os.path.getsize(t5_checkpoint_path),
+                fsdp=t5_fsdp,
+            )
+            self.text_encoder = T5EncoderModel(
+                text_len=config.text_len,
+                dtype=config.t5_dtype,
+                device=torch.device('cpu'),
+                checkpoint_path=t5_checkpoint_path,
+                tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
+                shard_fn=shard_fn if t5_fsdp else None,
+                meta_load=self.t5_meta_load,
+                init_event=partial(_emit_pipeline_init_event, self.rank),
+            )
+            _emit_pipeline_init_event(
+                self.rank,
+                "t5_load",
+                "complete",
+                started_at=t5_started,
+                fsdp=t5_fsdp,
+            )
 
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
@@ -404,27 +423,37 @@ class SCAIL2Pipeline:
             started_at=vae_started,
         )
 
-        clip_checkpoint_path = os.path.join(
-            checkpoint_dir, config.clip_checkpoint
-        )
-        clip_started = time.monotonic()
-        _emit_pipeline_init_event(
-            self.rank,
-            "clip_load",
-            "start",
-            checkpoint_bytes=os.path.getsize(clip_checkpoint_path),
-        )
-        self.clip = CLIPModel(
-            dtype=config.clip_dtype,
-            device=self.device,
-            checkpoint_path=clip_checkpoint_path,
-            tokenizer_path=os.path.join(checkpoint_dir, config.clip_tokenizer))
-        _emit_pipeline_init_event(
-            self.rank,
-            "clip_load",
-            "complete",
-            started_at=clip_started,
-        )
+        self.clip = None
+        if self.precomputed_conditioning:
+            _emit_pipeline_init_event(
+                self.rank,
+                "clip_load",
+                "complete",
+                started_at=time.monotonic(),
+                skipped=True,
+            )
+        else:
+            clip_checkpoint_path = os.path.join(
+                checkpoint_dir, config.clip_checkpoint
+            )
+            clip_started = time.monotonic()
+            _emit_pipeline_init_event(
+                self.rank,
+                "clip_load",
+                "start",
+                checkpoint_bytes=os.path.getsize(clip_checkpoint_path),
+            )
+            self.clip = CLIPModel(
+                dtype=config.clip_dtype,
+                device=self.device,
+                checkpoint_path=clip_checkpoint_path,
+                tokenizer_path=os.path.join(checkpoint_dir, config.clip_tokenizer))
+            _emit_pipeline_init_event(
+                self.rank,
+                "clip_load",
+                "complete",
+                started_at=clip_started,
+            )
 
         logging.info(
             "Creating WanSCAILModel from %s with %s resident parameters",
@@ -692,6 +721,7 @@ class SCAIL2Pipeline:
                  offload_model=True,
                  additional_ref_imgs: list[torch.Tensor] = None,
                  additional_ref_mask_imgs: list[torch.Tensor] = None,
+                 conditioning: dict[str, torch.Tensor] = None,
                  **kwargs):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
@@ -837,22 +867,38 @@ class SCAIL2Pipeline:
         if n_prompt is None:
             n_prompt = ""
 
-        if not self.t5_cpu:
-            self.text_encoder.model.to(self.device)
-            context = self.text_encoder([input_prompt], self.device)
-            context_null = self.text_encoder([n_prompt], self.device)
-            if offload_model:
-                self.text_encoder.model.cpu()
+        if conditioning is not None:
+            required = {"text_context", "negative_context", "clip_context"}
+            if set(conditioning) != required:
+                raise ValueError(
+                    "Precomputed conditioning keys mismatch: "
+                    f"expected {sorted(required)}, got {sorted(conditioning)}"
+                )
+            context = [conditioning["text_context"].to(self.device)]
+            context_null = [conditioning["negative_context"].to(self.device)]
+            clip_context = conditioning["clip_context"].to(self.device)
         else:
-            context = self.text_encoder([input_prompt], torch.device('cpu'))
-            context_null = self.text_encoder([n_prompt], torch.device('cpu'))
-            context = [t.to(self.device) for t in context]
-            context_null = [t.to(self.device) for t in context_null]
+            if self.text_encoder is None or self.clip is None:
+                raise ValueError(
+                    "This pipeline was created for precomputed conditioning, "
+                    "but no conditioning tensors were provided"
+                )
+            if not self.t5_cpu:
+                self.text_encoder.model.to(self.device)
+                context = self.text_encoder([input_prompt], self.device)
+                context_null = self.text_encoder([n_prompt], self.device)
+                if offload_model:
+                    self.text_encoder.model.cpu()
+            else:
+                context = self.text_encoder([input_prompt], torch.device('cpu'))
+                context_null = self.text_encoder([n_prompt], torch.device('cpu'))
+                context = [t.to(self.device) for t in context]
+                context_null = [t.to(self.device) for t in context_null]
 
-        self.clip.model.to(self.device)
-        clip_context = self.clip.visual([img[:, None, :, :]])
-        if offload_model:
-            self.clip.model.cpu()
+            self.clip.model.to(self.device)
+            clip_context = self.clip.visual([img[:, None, :, :]])
+            if offload_model:
+                self.clip.model.cpu()
 
         @contextmanager
         def noop_no_sync():
