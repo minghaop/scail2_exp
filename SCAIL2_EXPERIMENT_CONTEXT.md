@@ -1,6 +1,6 @@
 # SCAIL2 推理吞吐量实验交接文档
 
-更新时间：2026-08-26
+更新时间：2026-08-27
 
 本文档用于在服务器上的 VS Code Remote-SSH/Codex 新会话中恢复本次讨论。开始实验前应复核本文中的推导值、服务器运行环境和线上代码版本。
 
@@ -14,6 +14,17 @@
 - 初始服务一次仅接收一个活动任务；新方案可以通过多个独立 worker 并发处理多个视频。
 - 当前优先研究：单 GPU worker，尽量常驻必要权重，其余权重放在 CPU 内存并按阶段加载。
 - 暂缓研究：7 张计算卡共享 1 张权重存储卡的“7+1”设计。
+
+### 当前实验资源与数据约束（2026-08-27）
+
+- 实验直接在宿主机 conda 环境 `scail2-single-gpu` 中运行，不通过容器。
+- 实验模型固定从本地存储 `/raid/scail-2-20260819` 读取。
+- 自 2026-08-27 最新指令起，单卡实验只允许使用物理 GPU 2，即 `CUDA_VISIBLE_DEVICES=2`。
+- 自 2026-08-27 最新指令起，双卡实验只允许使用物理 GPU 2、3，即 `CUDA_VISIBLE_DEVICES=2,3`；此前使用 GPU 4、5 的记录仅为历史实验事实。
+- 其他 GPU 不得用于实验任务。
+- 当前测试数据为 `testdata/101`；常规实验固定使用这一组，只有明确需要比较输入时才切换。
+- 无服务双卡 FSDP 命令行入口为 `run_fsdp_experiment.py`。它固定绑定物理 GPU 2、3，并复用当前 `Scail2InferenceEngine`、T5 FSDP 和 DiT FSDP 实现。
+- `run_fsdp_experiment.py` 默认将每次运行的完整 stdout/stderr 实时写入 `experiment_logs/fsdp_baseline/<输出视频文件名>.log`，同时保留终端输出；落盘的每条日志均带有本地时区和毫秒精度的 ISO 8601 时间戳。
 
 ## 2. 需要先阅读的文件
 
@@ -291,3 +302,152 @@ wan/distributed/fsdp.py，以及 experiment_logs 下的两份日志。
 - 首轮使用短输入或单 segment，避免直接运行完整视频。
 - 修改前备份或建立新的实验副本；当前本地目录没有 `.git`，服务器侧建议先初始化实验仓库或复制到版本化目录。
 - 每次记录精确命令、代码 diff、环境变量、GPU 绑定、开始/结束时间和结果。
+
+## 14. 双卡 FSDP init-only 基线（2026-08-27）
+
+- 命令：`python -u run_fsdp_experiment.py --init-only`
+- GPU：物理 GPU 4、5；初始化结束后两卡显存均释放到 0 MiB。
+- 日志：`experiment_logs/fsdp_baseline/101-20260827-133218.log`
+- 结果：成功完成 process group、全部模型加载、DiT FSDP 包装和 readiness 同步后退出；没有进入推理，也没有生成 MP4。
+- 两个 rank 的 `engine_load` 均为 289.269 秒，`pipeline_load` 约为 284.9 秒。
+- 关键 rank（rank 0）的主要阶段：T5 加载/FSDP 79.668 秒，VAE 2.537 秒，CLIP 1.417 秒，DiT 空模型构建及 BF16 转换 178.546 秒，DiT checkpoint 复制 5.728 秒，DiT FSDP 包装及同步 11.790 秒。
+- rank 1 的 T5 阶段更快（65.696 秒），因此在 `pre_fsdp_barrier` 等待 rank 0 共 11.229 秒；rank 0 只等待 0.283 秒。当前双卡初始化关键路径由 rank 0 主导。
+- `warmup()` 当前只执行 CUDA synchronize 和 distributed barrier，不进行模型 forward；本基线衡量的是模型可用前的加载/同步成本，而非首个推理请求的 kernel/JIT 预热成本。
+
+## 15. DiT meta+assign 初始化实验（2026-08-27）
+
+- 实验开关：`EngineConfig.dit_meta_load`，默认 `False`；`run_fsdp_experiment.py` 显式设置为 `True`，因此未改变生产调用方的默认行为。
+- 日志：`experiment_logs/fsdp_baseline/101-20260827-141715.log`。
+- 方法：在 meta device 上构建 DiT 骨架，通过 `load_state_dict(..., assign=True)`直接挂载 BF16 safetensors 参数，并在 FSDP 前重新物化 checkpoint 未包含的 RoPE `freqs`；强制检查不存在残留 meta parameter/buffer。
+- 结果：init-only 成功，`engine_load` 从 276.538 秒降至 84.962 秒，减少 191.576 秒（69.3%，约 3.25 倍加速）；`pipeline_load` 从 273.686 秒降至约 82.4 秒。
+- DiT 构建从最多 181.140 秒降至 0.169 秒；checkpoint read/validate/assign 合计约 0.07 秒，包含 freqs 物化和 GC 的聚合阶段最多 0.219 秒；DiT FSDP 包装最多 4.900 秒。
+- 当前剩余最大瓶颈为未优化的 T5，两个 rank 分别为 69.881 秒和 70.711 秒。
+- 本轮仅验证模型加载、参数 dtype/meta 完整性、FSDP 包装和 readiness 同步，尚未通过实际 DiT forward 或完整视频推理验证数值正确性；进入后续优化前应先做一次固定 seed 的完整推理回归。
+
+## 16. T5 meta+assign 与完整推理回归（2026-08-27）
+
+- 实验开关：`EngineConfig.t5_meta_load`，默认 `False`；实验脚本同时启用 T5 和 DiT meta 加载。
+- T5 使用 meta 构建、`torch.load(weights_only=True, mmap=True)` 和 `load_state_dict(assign=True)`，FSDP 前强制检查无残留 meta parameter/buffer。
+- init-only 日志：`experiment_logs/fsdp_baseline/101-20260827-142145.log`。结果成功，T5 总阶段从约 70 秒降至最多 2.937 秒，`engine_load` 从最初 276.538 秒降至 16.511 秒，`pipeline_load` 最多 13.881 秒。
+- 完整推理日志：`experiment_logs/fsdp_baseline/101-20260827-142221.log`。初始化成功（`engine_load=16.857` 秒），T5 forward 和至少两个 DiT sampling step 成功，证明 meta 参数及重新物化的 RoPE `freqs` 已进入真实计算。
+- 完整推理在第 1/4 segment、约 2/6 sampling step 后长时间无进展：GPU 5 持续约 100% SM、GPU 4 等待，未发现新的 Xid/SXid。用户确认此前也发生过类似停顿，因此当前证据不足以将其归因于 meta 优化。
+- 本次卡死任务已人工终止；孤立的两个 worker PID 也已清理，GPU 4、5 最终均为 0 MiB。没有生成最终 MP4；这里仅表示 T5+DiT meta 优化后的完整回归未通过，并不表示新命令行入口从未端到端成功。
+- 第二次完整回归日志：`experiment_logs/fsdp_baseline/101-20260827-143208.log`。初始化再次成功（`engine_load=16.634` 秒），随后稳定复现相同停顿：第 1/4 segment 的 2/6 sampling step 后无进展，GPU 4 为 0%、GPU 5 为 100%，显存分别约 39267 MiB 和 40217 MiB。任务已通过定向 SIGTERM 清理，无孤立进程、无 MP4，GPU 4、5 最终均回到 0 MiB。
+- 两次优化后完整回归在相同位置和相同 GPU 利用率形态停顿，后续不应继续盲目重跑；应在 sampling step/FSDP collective 边界增加 rank-aware 埋点或启用 NCCL flight recorder，以确认两个 rank 的 collective 序列是否发生分歧。由于用户确认优化前也曾出现类似问题，现阶段仍不能仅凭复现位置认定 meta 加载是根因。
+
+## 17. 第三次完整推理与逐步定位（2026-08-27）
+
+- 日志：`experiment_logs/fsdp_baseline/101-20260827-143713.log`；未生成 MP4。
+- 为采样循环增加 rank-aware 的 step、conditional forward 和 scheduler step 埋点，并在 forward/step 后显式执行 CUDA synchronize，避免异步 CUDA 提交使完成日志产生歧义。
+- 初始化再次成功：两个 rank 的 `engine_load` 均为 16.654 秒，`pipeline_load` 最大为 14.024 秒。
+- rank 0/1 均完成第 1、2 个 sampling step；conditional forward 每步约 17.6--17.7 秒，scheduler step 不超过 0.003 秒。两个 rank 随后都进入 segment 1、step 3 的 `sampling_cond_forward`，但都没有输出 complete。
+- 受限执行环境内按命令行特征过滤时未匹配到 worker/torchrun，且其中的 `/proc` 视图也不可见对应 PID；这不是宿主机进程已经退出。通过宿主机进程视图确认两个 worker 仍存活，并已成为 PPID 1 的孤儿进程：PID 3534737 是 rank 0/local rank 0，PID 3534738 是 rank 1/local rank 1。最外层 launcher 的 Ctrl+C 没有结束它们。
+- 宿主机 `nvidia-smi` 正常：GPU 4 为 0% utilization、39267 MiB，GPU 5 为 100% utilization、40217 MiB。rank 0 主线程主要在 `hrtimer_nanosleep` 等待；rank 1 主线程持续接近 100% CPU，且 GPU 5 保持 100%。这与前两次复现的等待/忙碌形态一致，故障边界为第三次 DiT conditional forward 内部的 GPU/FSDP 执行。
+- 本次故障期间内核日志没有出现新的 Xid/SXid。系统历史日志存在 NVSwitch fatal SXid 10003/heartbeat timeout，以及 NVSwitch kernel 575.57.08 与 user 535.129.03 的版本不一致记录，但当前证据不能证明这些历史记录导致了本次停顿。
+- 在清理 PID 3534737、3534738 前不要启动新实验。若要继续定位，应先保留现场采集 rank 线程栈/NCCL 状态，或清理后启用 NCCL flight recorder 重新运行，以定位 step 3 内部的 FSDP collective。
+- 宿主机现场诊断：`nvidia-smi pmon/dmon` 显示 rank 1/GPU 5 长期为 99--100% SM，但显存利用率、PCIe 流量均为 0，功耗仅约 85 W；GPU 4 为 0% SM、约 63 W。两次读取 NVLink throughput counters 完全相同，证明卡住期间没有 NVLink 数据传输。这不像正常 DiT 计算，更符合低功耗等待/自旋 kernel（包括可能的 NCCL 等待 kernel）。
+- NVLink error counters 中，GPU 5 Link 5 累计 replay=66348、CRC=65535（计数饱和）；GPU 4 Link 6 累计 replay=31461，GPU 5 Links 8/9/10/11 也有 replay。短时间复读时计数未继续增加，因此这些是自上次 reset 起的累计异常，属于重要硬件/链路风险信号，但不能单独证明本次卡死由它触发。
+- GPU 4、5 当前 ECC、row remap、PCIe replay 和 `GPU Recovery Action` 均无异常，本次期间内核日志也没有新增 Xid/SXid。DCGM host engine 未运行，无法采集 Tensor/DRAM profiler 指标。
+- 由于两个 worker 已成为 PPID 1 的孤儿进程，Yama ptrace policy 禁止普通用户 gdb attach；无密码 sudo 也不可用，因此未取得决定性的原生/Python 栈。进程超过约 10 分钟仍没有 NCCL timeout/trace 输出，当前任务又未预先启用 flight recorder，无法从存量进程补取 collective 序号。
+- 用户随后要求清理两个孤儿 worker；执行前精确复核时 PID 3534737、3534738 已自行退出，因此 SIGTERM 返回 `No such process`，没有信号发送到其他进程。GPU 4、5 均已释放至 0 MiB、0% utilization，宿主机无本次实验残留进程。日志未补出 timeout/trace 信息。
+
+## 18. 实验 GPU 切换与健康检查（2026-08-27）
+
+- 后续实验从物理 GPU 4、5 切换到物理 GPU 2、3；单卡固定使用 GPU 2，双卡固定使用 GPU 2、3。`run_fsdp_experiment.py` 的硬编码绑定和环境校验已同步修改为 `CUDA_VISIBLE_DEVICES=2,3`。
+- 检查时 GPU 2、3 均为空闲状态：0% utilization、0 MiB used。PCI 地址分别为 `0000:47:00.0` 和 `0000:4e:00.0`。
+- 两卡各 12 条 NVLink 均为 active/25 GB/s；所有 NVLink replay、recovery、CRC error counters 均为 0。两卡 PCIe replay 均为 0，`GPU Recovery Action=None`。
+- 内核日志没有指向 GPU 2/`47:00` 或 GPU 3/`4e:00` 的 NVRM Xid。历史 Xid 62/45/74/154 明确指向 `90:00`，即原 GPU 5。
+- GPU 2 的 volatile/aggregate ECC 和 row remap 均为 0。GPU 3 当前 volatile ECC 为 0，生命周期 aggregate DRAM correctable=15、correctable remapped rows=2；无 uncorrectable error、无 pending row、无 remapping failure。这与 GPU 5 的大量 NVLink replay/CRC 错误不是同类或同量级问题，当前可用于实验，但后续每次实验前后应复读 GPU 2、3 的 NVLink/ECC counters。
+
+## 19. GPU 2、3 完整推理对照实验（2026-08-27）
+
+- 日志：`experiment_logs/fsdp_baseline/101-20260827-145329.log`；输出目标为 `experiment_outputs/fsdp_baseline/101-20260827-145329.mp4`，但未生成 MP4。
+- 实验前 GPU 2、3 均为 0 MiB/0%，两卡所有 NVLink replay/recovery/CRC counters 均为 0。
+- 初始化成功：两个 rank 的 `engine_load` 均为 17.949 秒，`pipeline_load` 最大为 15.229 秒。
+- rank 0/1 均完成 segment 1 的 sampling step 1、2，每次 conditional forward 约 17.6--17.8 秒；随后两个 rank 都进入 step 3 的 `sampling_cond_forward` 且不再 complete，与 GPU 4、5 上三次复现的位置完全相同。
+- 卡死现场为 local rank 0/物理 GPU 2：0% utilization、39267 MiB；local rank 1/物理 GPU 3：100% utilization、40217 MiB。实验后复读 GPU 2、3 的全部 NVLink error counters 仍为 0。
+- 本次卡死任务通过精确 SIGTERM 终止 worker PID 3554391、3554392 和 torchrun PID 3554317；无残留进程，GPU 2、3 均释放到 0 MiB/0%。
+- 关键结论：相同卡死位置和“rank 0 等待、rank 1 忙碌”形态在健康且 NVLink error=0 的 GPU 2、3 上复现，因此原 GPU 5 的历史 Xid/NVLink 错误不是复现该故障的必要条件。现有证据明显更支持 rank/软件路径相关的 FSDP collective、CUDA stream 同步或执行序列问题，而非单张物理 GPU 5 的硬件故障。
+
+## 20. 新命令行入口的标准加载成功基线（2026-08-27，补记）
+
+- 在自动保存日志功能加入前，新命令行入口曾于 13:13--13:26 完整成功运行一次；当时没有保留 stdout/stderr 日志，但输出文件仍存在：`experiment_outputs/fsdp_baseline/101-20260827-131318.mp4`，大小 19587416 bytes。
+- `ffprobe` 验证该输出为 H.264、512×896、30 fps、297 帧、9.9 秒；当前固定输入 `testdata/101/driving_video.mp4` 同样为 512×896、30 fps、297 帧、约 9.9 秒，因此这是当前测试数据的新入口完整成功基线，而不是 2026-08-25 的旧服务样例。
+- 该成功运行发生在 DiT meta 实验（约 14:17）和 T5 meta 实验之前。当时 T5 在 CPU 正常构造并使用标准 `load_state_dict(assign=False)`；DiT 在 CPU 正常构造、转换 BF16 后使用标准 `load_state_dict(assign=False)`，随后进行相同的双卡 FSDP 包装。
+- 此后同时启用 T5/DiT meta+assign 的四次完整回归均在 segment 1、sampling step 3 的 DiT conditional forward 内以相同 rank 形态卡住，其中一次已在健康 GPU 2、3 上复现。由此应将 meta+assign 加载优化或其伴随改动列为首要嫌疑；GPU 5 硬件错误和测试数据差异已不能解释该对照。
+- 下一步应先在当前代码和 GPU 2、3 上恢复 `t5_meta_load=False, dit_meta_load=False`，复现已知成功基线；成功后逐项启用 T5 meta、DiT meta，以确定具体责任路径。不要再使用 2026-08-25 旧服务日志作为该判断的主要对照。
+
+## 21. 三组加载模式并行对照实验（2026-08-27）
+
+- 为避免使用 GPU 4、5，命令行入口新增 `--physical-gpus`，仅允许从物理 GPU 0、1、2、3、6、7 中选择两个互异编号；本轮并行运行三组双卡作业。实验前六张卡均为空闲，GPU 0、1、2、3、6 的 NVLink error counters 全为 0；GPU 7 只有 Link 9 的历史 replay=1，CRC/recovery 均为 0。
+- 标准 T5 + 标准 DiT，GPU 2、3：日志 `experiment_logs/fsdp_baseline/101-20260827-150449.log`。初始化成功，`engine_load=272.008` 秒；进入视频生成后停在首个 segment 的预处理阶段，没有输出 `Processing segment 1/4`，物理 GPU 2 为 100%、GPU 3 为 0%。
+- meta T5 + 标准 DiT，GPU 0、1：日志 `experiment_logs/fsdp_baseline/101-t5meta-ditstandard-gpu01-20260827-150800.log`。初始化成功，`engine_load` 最大为 208.160 秒；两个 rank 均完成 sampling step 1、2，随后停在 segment 1、step 3 的 `sampling_cond_forward`。
+- 标准 T5 + meta DiT，GPU 6、7：日志 `experiment_logs/fsdp_baseline/101-t5standard-ditmeta-gpu67-20260827-151000.log`。初始化成功，`engine_load=88.302` 秒；两个 rank 均完成 sampling step 1、2，随后同样停在 segment 1、step 3 的 `sampling_cond_forward`。
+- 两个进入 step 3 的混合加载作业每步 conditional forward 均约 17.6--17.8 秒；观察超过正常单步时长后没有任何 rank 输出 complete。现场呈现每组一张卡 100%、另一张卡 0% 的相同不对称利用率。
+- 三个作业均未生成 MP4。确认无进展后通过各自前台会话发送 Ctrl+C 精确终止，所有 torchrun/worker 均随父进程退出；GPU 0、1、2、3、6、7 最终均为 0 MiB/0%，GPU 4、5 全程未使用。
+- 结论：meta 开关不是本轮卡死的必要条件；纯标准加载作业在并发场景下也发生了活性故障。因此不能再把“是否使用 meta+assign”视为唯一变量或直接根因。不过纯标准组没有到达 step 3，三组又并发共享主机资源，本轮不能严格复现单作业条件下的成功基线，也不能据此排除 meta 优化伴随的其他代码改动。下一步应停止并行 A/B，先单独运行纯标准组；若仍失败，则比较 13:13 成功运行之后的源代码改动，并优先定位 forward/FSDP 执行序列。
+
+## 22. 移除采样 CUDA synchronize 后的单作业标准加载实验（2026-08-27）
+
+- 移除了此前为逐步定位新增的三处 `torch.cuda.synchronize(self.device)`：conditional forward、unconditional forward 和 scheduler step 之后；保留分段清理、最终同步和 warmup 等原有生命周期同步点。
+- 单独在物理 GPU 2、3 上运行标准 T5 + 标准 DiT，实验前两卡均为空闲，全部 NVLink replay/recovery/CRC counters 为 0。
+- 日志：`experiment_logs/fsdp_baseline/101-20260827-152158.log`；初始化成功，两个 rank 的 `engine_load` 均为 268.976 秒。
+- 本次顺利越过了上一轮纯标准并发作业偶发停住的分段预处理，并完成 segment 1 的 sampling step 1、2；随后两个 rank 均进入 step 3 的 `sampling_cond_forward`，没有输出 complete，再次复现相同卡死位置。
+- 用户确认不再继续等待后，通过前台会话 Ctrl+C 精确终止作业；所有 worker/torchrun 均退出，GPU 2、3 回到 0 MiB/0%，未生成 MP4。
+- 结论：新增的三处 device-wide CUDA synchronize 不是该 step 3 卡死的必要条件。后续应继续二分 meta 优化期间对公共标准路径的其他源代码改动，或直接恢复 13:13 成功时的 legacy standard 路径做单作业对照。
+
+## 23. 完整回滚至成功版本后的 legacy-standard 测试（2026-08-27）
+
+- Git 历史显示 13:13 成功运行之后，提交 `148837e`（14:08，`Added some logs`）修改了 `wan/scail.py`、模型、VAE、CLIP 和分布式代码；之后工作区又加入了 meta/T5/DiT 优化与采样诊断。运行时代码现已全部恢复到 `f26e969`（13:20，仅提交 `testdata/101`）中的内容，并通过逐文件 `git diff --exit-code f26e969 -- ...` 验证完全一致。
+- 保留了实验日志、输出目录、上下文文档、`.gitignore`，以及外层 CLI 的日志保存/时间戳/GPU 绑定能力；CLI 已移除对 `t5_meta_load`、`dit_meta_load` 配置字段的依赖，不改变 legacy 模型执行路径。
+- 第一次尝试日志：`experiment_logs/fsdp_baseline/101-20260827-153131.log`。该作业发生用户此前确认的偶发加载卡死：两个 rank 均进入 `dit_fsdp_wrap` 后不再 complete，物理 GPU 2 为 100%、GPU 3 为 0%。终止并释放两卡后进行一次受控重试。
+- 第二次尝试日志：`experiment_logs/fsdp_baseline/101-20260827-153842.log`。初始化成功，两个 rank 的 `engine_load` 均为 271.447 秒；进入 segment 1 后 tqdm 正常完成 1/6、2/6，随后第三步长时间无进展，与后续代码逐步埋点确认的 step 3 卡死位置一致。
+- 用户请求的是完整测试，但第二次作业已明确复现卡死，故没有继续等待；通过前台 Ctrl+C 精确终止，所有 worker/torchrun 均退出，GPU 2、3 回到 0 MiB/0%，两次均未生成 MP4。
+- 关键结论：13:13 成功之后的源代码修改不是 step 3 卡死的必要条件；完整恢复 legacy 运行时代码仍可复现。因此应把后续排查重点转向成功运行与当前运行之间的非代码状态差异，例如 GPU 对/拓扑、驱动或 NCCL 状态、进程启动环境、资源并发、输入/模型文件缓存状态及其他宿主机运行状态。当前成功样例使用的物理 GPU 对也应复核，但继续遵守不使用 GPU 4、5 的约束。
+
+## 24. 跨机器复现实验（2026-08-27，补记）
+
+- 在 legacy-standard 路径已经完整回滚、但原机器仍复现卡死后，将当前实验工作区迁移到另一台服务器做机器变量对照。用户确认新服务器的硬件和软件配置与原服务器完全相同；实验仍不经过容器，继续使用相同的 Conda 环境、模型目录、固定 `testdata/101` 输入和双卡 FSDP 命令行入口。
+- 在新服务器上重新运行了一次完整推理实验，使用的远端日志名为 `experiment_logs/fsdp_baseline/101-20260827-155730.log`。该日志只存在于另一台服务器，切回原服务器时没有同步，因此当前工作区不应将它当作可直接读取的本地证据。
+- 新服务器上的实验仍出现了与原服务器相同的推理失败/卡死现象，没有完成端到端输出。由于远端日志未同步，本记录不补写当前无法重新核对的具体 rank、block、显存数值或进程 PID。
+- 随后工作环境切回原服务器；另一台服务器上最后写入的上下文修改和实验日志均未带回，也没有必要据此更改当前源代码。
+- 该跨机器对照排除了“仅由原服务器的临时 GPU/NVLink/驱动状态触发”这一解释，支持继续从两台机器共有的软件执行路径和显存管理行为排查。后续在原服务器上的诊断最终确认首发故障为 CUDA allocator 碎片化导致的 rank 0 OOM，NCCL 等待是次生现象。
+
+## 25. FSDP 卡死根因与 CUDA allocator 验证（2026-08-27）
+
+- 为 legacy-standard 路径加入了仅由 `--diagnose-fsdp` 启用的诊断能力：各 DiT block 的 rank-aware 前后埋点、CUDA allocated/reserved 显存、NCCL desync/flight-recorder 信息，以及 120 秒 process-group watchdog。诊断开关关闭时不改变模型 forward 路径。
+- 根因日志：`experiment_logs/fsdp_baseline/101-20260827-160920.log`。两个 rank 均完整完成 sampling step 1、2；step 3 时 rank 0 完成 block 0 后进入 block 1，rank 1 则继续完成 block 1--3 并进入 block 4，首次精确定位到 rank 执行序列发生分叉的位置。
+- rank 0 的真实异常是 `torch.OutOfMemoryError`：在 `wan/modules/model_scail2.py` 的 block 1 FFN/GELU 中申请 1.26 GiB 失败。此时 GPU 仍有 1.15 GiB 物理空闲，PyTorch 已分配 32.23 GiB、另有 5.01 GiB reserved-but-unallocated，符合 CUDA caching allocator 碎片化，而不是模型总显存需求绝对超过 40 GiB。
+- rank 0 OOM 后没有加入下一次 FSDP all-gather；rank 1 已继续提交后续 collective，因而表现为一张卡 0%、另一张卡 100%。watchdog 最终报告 rank 0 完成 collective #302 但未加入 #303，rank 1 已提交到 #304；`SeqNum=303` 的 `_ALLGATHER_BASE` 在 120 秒后超时。此前观察到的 NCCL“卡死”是 rank 0 OOM 后的次生通信等待，不是首发故障。
+- 修复验证日志：`experiment_logs/fsdp_baseline/101-20260827-161806.log`。命令行额外启用 `--expandable-segments`，即在 torch worker 启动前设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`；其余仍为 legacy-standard 双卡 FSDP 路径和同一组 `testdata/101` 输入。
+- 启用 expandable segments 后，长 segment 的初始 reserved 显存由失败实验约 38.0--38.2 GiB 降至约 29.3 GiB，运行高峰约 38.2 GiB；两个 rank 的显存轨迹保持一致。四个 segment、每段 6 个 sampling step 均完成，没有 OOM、rank 分叉或 watchdog timeout，进程以 exit code 0 正常退出。
+- 输出 `experiment_outputs/fsdp_baseline/101-20260827-161806.mp4` 已由 `ffprobe` 验证：H.264、512x896、30 fps、297 帧、9.9 秒、19587416 bytes。结束后 GPU 2、3 均为 0 MiB/0%，无残留作业。
+- 结论：当前反复出现的 step 3 卡死已经有确定的软件根因和可复现实验修复；它与 meta/standard 加载开关、GPU 5 历史硬件错误及机器迁移均无必然关系。后续实验至少应启用 expandable segments，并保留 watchdog 作为故障快速暴露手段。日志中的 IB/RoCE HCA 合并 warning 在本次成功运行中仍出现，因此不是本轮卡死的必要条件，但后续可独立清理 NCCL HCA 配置。
+
+## 26. 恢复全部启动加载优化并完成 init-only 回归（2026-08-27）
+
+- 在确认首发故障是 CUDA allocator 碎片化、而不是 meta 加载后，从本机 Git 不可达对象中找回了此前实际运行过的优化代码快照，并将加载相关改动重新合并到当前 legacy-standard+诊断代码上；没有用手工推测替代旧实现，也没有覆盖当前 watchdog、FSDP block 诊断或 expandable allocator 开关。
+- `EngineConfig` 重新加入 `t5_meta_load` 和 `dit_meta_load`，默认仍为 `False`，因此没有改变其他调用方的默认加载方式；实验命令行入口固定同时启用两项优化，并在日志头标记 `T5=meta-assign, DiT=meta-assign`。
+- T5 恢复为 meta device 构建，使用 `torch.load(weights_only=True, mmap=True)` 读取 checkpoint，再通过 `load_state_dict(strict=True, assign=True)` 直接绑定参数；FSDP 前检查不存在残留 meta parameter/buffer。VAE 原路径本来已经是 meta+assign，无需重复修改。
+- DiT 恢复为 meta device 构建和 safetensors `assign=True` 加载；checkpoint 未包含且不注册为 parameter/buffer 的 RoPE `freqs` 在 CPU 上重新物化，并在 FSDP 前检查所有 parameter、buffer 和 `freqs` 都已离开 meta device。
+- 第一次 init-only 启动日志为 `experiment_logs/fsdp_baseline/101-20260827-163914.log`；该次在受限执行沙箱内因本地 TCPStore 无法解析/连接 `localhost` 而在 process group 建立前失败，未进入模型加载、未占用 GPU。随后以完全相同的程序参数在允许本机 rank 通信的宿主执行环境重跑。
+- 有效验证日志：`experiment_logs/fsdp_baseline/101-20260827-164018.log`。物理 GPU 2、3，命令行启用 `--init-only --expandable-segments`；两个 rank 均成功完成 T5/DiT meta 构建、checkpoint assign、FSDP 包装、barrier 和 ready，进程 exit code 0。
+- 本轮两个 rank 的 `engine_load` 均为 17.828 秒，`pipeline_load` 最大 15.227 秒；T5 总阶段最大 3.162 秒，T5 构建约 0.096 秒、mmap read 约 0.030 秒、assign 约 0.007 秒；DiT 构建最大 0.163 秒、checkpoint copy 聚合阶段最大 0.234 秒、FSDP 包装最大 5.017 秒。性能与此前 meta 优化实验一致。
+- init-only 按设计没有进入推理、没有生成 MP4。结束后 GPU 2、3 均回到 0 MiB/0%，无残留作业。退出时仍有 PyTorch FSDP weak-reference `PyInterpreter.cpp` warning，但不影响 readiness 或 exit code；完整推理组合回归尚未在本次修改后重新执行，后续运行必须继续启用 expandable segments。
+
+## 27. 恢复初始化日志与 AMP warning 修复（2026-08-27）
+
+- 恢复提交 `148837e` 中与启动相关的分段计时日志：DiT checkpoint header、T5、VAE、CLIP、DiT model construct/checkpoint/FSDP wrap，以及 engine/process-group/barrier/ready；同时保留 meta 加载新增的 T5 construct/read/assign 和 DiT read/validate/assign 子阶段。没有恢复曾用于卡死定位、会在每个 sampling forward 后强制 `torch.cuda.synchronize()` 的临时日志代码。
+- 将 `wan/scail.py`、模型、VAE、CLIP 和分布式路径中的旧 `torch.cuda.amp.autocast` / `amp.autocast` 全部恢复为 `torch.amp.autocast("cuda", ...)`，并删除不再使用的 `torch.cuda.amp` import。源码扫描已确认 `wan/**/*.py` 中没有残留 `torch.cuda.amp`。
+- 回归日志：`experiment_logs/fsdp_baseline/101-20260827-164502.log`。物理 GPU 2、3，`--init-only --expandable-segments`，T5/DiT 均使用 meta-assign；两个 rank 的 `engine_load` 均为 17.821 秒，完整输出初始化阶段日志并达到 ready，进程 exit code 0。
+- 回归日志中没有 `FutureWarning`、`torch.cuda.amp`、OOM 或 traceback；结束后 GPU 2、3 均为 0 MiB/0%。仍可见的 `PyInterpreter.cpp` weak-reference warning 来自 FSDP 对象退出清理，与本次已消除的 AMP deprecation warning 不同。
+
+## 28. 加速加载后的完整推理回归（2026-08-27）
+
+- 在物理 GPU 2、3 上运行完整双卡 FSDP 推理，固定使用 `testdata/101`，T5 和 DiT 均启用 meta-assign 加速加载，同时启用 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`；本轮未启用高噪声的逐 block FSDP 诊断。
+- 执行命令：`python -u run_fsdp_experiment.py --physical-gpus 2,3 --expandable-segments`。日志：`experiment_logs/fsdp_baseline/101-20260827-164739.log`；输出：`experiment_outputs/fsdp_baseline/101-20260827-164739.mp4`。
+- 两个 rank 的 `engine_load` 均为 17.862 秒，`pipeline_load` 最大 15.112 秒；T5 meta-assign 总阶段最大 3.122 秒，DiT meta 构建最大 0.166 秒、checkpoint assign 0.032 秒、FSDP wrap 最大 5.051 秒。两端均完成 ready barrier 后进入生成。
+- 四个 segment 全部完成，每段 6 个 sampling step；前三个 81 帧 segment 每步约 17.4 秒，最后一个 57 帧 segment 每步约 10.8 秒。音频合并耗时 2.428 秒，任务 JSON 返回 `status=success`，进程 exit code 0。
+- `ffprobe` 验证输出包含 H.264 视频和 AAC 音频：512x896、30 fps、297 帧、9.9 秒、19587416 bytes。输出规格和此前 legacy-standard+expandable 成功基线完全一致。
+- 日志中没有 AMP `FutureWarning`、OOM、traceback、NCCL error 或 timeout。退出清理阶段仍有已知的 FSDP `PyInterpreter.cpp` weak-reference warning，但不影响结果保存和正常退出。
+- 结束后包括 GPU 2、3 在内的全部 GPU 均为 0 MiB、0% utilization，无实验残留进程。该回归确认 T5/DiT meta-assign 加载优化与 expandable allocator 可以共同完成端到端推理，加载优化本身不会导致此前的 step 3 停顿。

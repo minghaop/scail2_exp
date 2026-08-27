@@ -8,7 +8,7 @@ import os
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
@@ -138,12 +138,24 @@ class Scail2InferenceEngine:
                     raise EnvironmentValidationError(
                         "Distributed process group is not initialized"
                     )
+                process_group_kwargs = {}
+                timeout_text = os.getenv("SCAIL2_PROCESS_GROUP_TIMEOUT_SECONDS")
+                if timeout_text:
+                    timeout_seconds = float(timeout_text)
+                    if timeout_seconds <= 0:
+                        raise EnvironmentValidationError(
+                            "SCAIL2_PROCESS_GROUP_TIMEOUT_SECONDS must be positive"
+                        )
+                    process_group_kwargs["timeout"] = timedelta(
+                        seconds=timeout_seconds
+                    )
                 dist.init_process_group(
                     backend=self.config.distributed_backend,
                     init_method="env://",
                     rank=self.rank,
                     world_size=self.world_size,
                     device_id=torch.device("cuda", self.local_rank),
+                    **process_group_kwargs,
                 )
                 self._owns_process_group = True
             if dist.get_rank() != self.rank or dist.get_world_size() != self.world_size:
@@ -235,6 +247,8 @@ class Scail2InferenceEngine:
             lora_path=None,
             lora_alpha=None,
             dit_resident_dtype=self.config.profile.resident_dtype,
+            dit_meta_load=self.config.dit_meta_load,
+            t5_meta_load=self.config.t5_meta_load,
         )
         return pipeline, cfg, identity
 

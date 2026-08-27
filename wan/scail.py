@@ -256,6 +256,8 @@ class SCAIL2Pipeline:
         lora_path=None,
         lora_alpha=None,
         dit_resident_dtype="fp32",
+        dit_meta_load=False,
+        t5_meta_load=False,
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -284,6 +286,12 @@ class SCAIL2Pipeline:
                 Storage dtype expected in the SCAIL checkpoint and retained by
                 DiT parameters. BF16 requires an offline fused checkpoint and
                 does not allow runtime LoRA fusion.
+            dit_meta_load (`bool`, *optional*, defaults to False):
+                Build the DiT structure on the meta device and assign checkpoint
+                tensors directly instead of initializing disposable parameters.
+            t5_meta_load (`bool`, *optional*, defaults to False):
+                Build T5 on the meta device and directly assign an mmap-backed
+                weights-only checkpoint before FSDP wrapping.
         """
         self.device = torch.device(f"cuda:{device_id}")
         self.config = config
@@ -306,6 +314,8 @@ class SCAIL2Pipeline:
         self.dit_resident_dtype_name = dit_resident_dtype_name(
             self.dit_resident_dtype
         )
+        self.dit_meta_load = bool(dit_meta_load)
+        self.t5_meta_load = bool(t5_meta_load)
         if self.dit_resident_dtype == torch.bfloat16 and self.lora_path is not None:
             raise ValueError(
                 "Runtime LoRA fusion is disabled for BF16-resident SCAIL. "
@@ -361,6 +371,8 @@ class SCAIL2Pipeline:
             checkpoint_path=t5_checkpoint_path,
             tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
             shard_fn=shard_fn if t5_fsdp else None,
+            meta_load=self.t5_meta_load,
+            init_event=partial(_emit_pipeline_init_event, self.rank),
         )
         _emit_pipeline_init_event(
             self.rank,
@@ -425,18 +437,27 @@ class SCAIL2Pipeline:
             "dit_model_construct",
             "start",
             resident_dtype=self.dit_resident_dtype_name,
+            load_mode="meta_assign" if self.dit_meta_load else "standard",
         )
-        self.model = SCAIL2Model.from_config(scail_config_path)
-        # Cast the empty CPU model before loading so a BF16 checkpoint is never
-        # expanded into an additional FP32 parameter copy by load_state_dict.
-        if self.dit_resident_dtype != torch.float32:
-            self.model.to(dtype=self.dit_resident_dtype)
+        model_config = SCAIL2Model.load_config(scail_config_path)
+        if self.dit_meta_load:
+            with torch.device("meta"):
+                self.model = SCAIL2Model.from_config(model_config)
+            if not all(parameter.is_meta for parameter in self.model.parameters()):
+                raise RuntimeError("DiT meta construction left materialized parameters")
+        else:
+            self.model = SCAIL2Model.from_config(model_config)
+            # Cast the CPU model before loading so a BF16 checkpoint is never
+            # expanded into an additional FP32 parameter copy by load_state_dict.
+            if self.dit_resident_dtype != torch.float32:
+                self.model.to(dtype=self.dit_resident_dtype)
         _emit_pipeline_init_event(
             self.rank,
             "dit_model_construct",
             "complete",
             started_at=dit_construct_started,
             resident_dtype=self.dit_resident_dtype_name,
+            load_mode="meta_assign" if self.dit_meta_load else "standard",
         )
         state_dict = None
         checkpoint_copy_started = time.monotonic()
@@ -444,9 +465,29 @@ class SCAIL2Pipeline:
             self.rank, "dit_checkpoint_copy", "start"
         )
         try:
+            checkpoint_read_started = time.monotonic()
+            _emit_pipeline_init_event(
+                self.rank, "dit_checkpoint_read", "start"
+            )
             state_dict = load_file(scail_safetensors_path)
+            _emit_pipeline_init_event(
+                self.rank,
+                "dit_checkpoint_read",
+                "complete",
+                started_at=checkpoint_read_started,
+            )
+            checkpoint_validate_started = time.monotonic()
+            _emit_pipeline_init_event(
+                self.rank, "dit_checkpoint_validate", "start"
+            )
             checkpoint_stats = validate_checkpoint_floating_dtypes(
                 state_dict, self.dit_resident_dtype
+            )
+            _emit_pipeline_init_event(
+                self.rank,
+                "dit_checkpoint_validate",
+                "complete",
+                started_at=checkpoint_validate_started,
             )
             logging.info(
                 "Validated SCAIL checkpoint: %d floating tensors, %d "
@@ -456,7 +497,43 @@ class SCAIL2Pipeline:
                 checkpoint_stats["tensor_bytes"] / 2**30,
                 self.dit_resident_dtype_name,
             )
-            self.model.load_state_dict(state_dict, strict=True)
+            checkpoint_assign_started = time.monotonic()
+            _emit_pipeline_init_event(
+                self.rank,
+                "dit_checkpoint_assign",
+                "start",
+                assign=self.dit_meta_load,
+            )
+            self.model.load_state_dict(
+                state_dict, strict=True, assign=self.dit_meta_load
+            )
+            _emit_pipeline_init_event(
+                self.rank,
+                "dit_checkpoint_assign",
+                "complete",
+                started_at=checkpoint_assign_started,
+                assign=self.dit_meta_load,
+            )
+            if self.dit_meta_load:
+                with torch.device("cpu"):
+                    self.model.freqs = self.model._make_freqs()
+                remaining_meta = [
+                    name
+                    for name, parameter in self.model.named_parameters()
+                    if parameter.is_meta
+                ]
+                remaining_meta.extend(
+                    name
+                    for name, buffer in self.model.named_buffers()
+                    if buffer.is_meta
+                )
+                if remaining_meta:
+                    examples = ", ".join(remaining_meta[:8])
+                    raise RuntimeError(
+                        "DiT checkpoint assignment left meta tensors: " + examples
+                    )
+                if self.model.freqs.is_meta:
+                    raise RuntimeError("DiT RoPE frequencies remain on the meta device")
         finally:
             del state_dict
             gc.collect()
@@ -528,6 +605,38 @@ class SCAIL2Pipeline:
                 started_at=fsdp_started,
                 sync_module_states=True,
             )
+            if os.getenv("SCAIL2_FSDP_DIAGNOSTICS") == "1":
+                root_module = getattr(self.model, "module", self.model)
+
+                def emit_block_event(stage, block_index):
+                    allocated = torch.cuda.memory_allocated(self.device) / 2**20
+                    reserved = torch.cuda.memory_reserved(self.device) / 2**20
+                    print(
+                        " ".join(
+                            [
+                                "SCAIL2_FSDP_DIAG",
+                                f"rank={self.rank}",
+                                f"stage={stage}",
+                                f"block={block_index}",
+                                f"allocated_mib={allocated:.1f}",
+                                f"reserved_mib={reserved:.1f}",
+                            ]
+                        ),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
+                for block_index, block in enumerate(root_module.blocks):
+                    block.register_forward_pre_hook(
+                        lambda _module, _args, index=block_index: emit_block_event(
+                            "block_pre", index
+                        )
+                    )
+                    block.register_forward_hook(
+                        lambda _module, _args, _output, index=block_index: emit_block_event(
+                            "block_post", index
+                        )
+                    )
         else:
             if not init_on_cpu:
                 placement_started = time.monotonic()
@@ -806,7 +915,24 @@ class SCAIL2Pipeline:
                 if offload_model:
                     self.model.to(self.device)
                 latent = apply_clean_history(latent, history_latent)
-                for _, t in enumerate(tqdm(timesteps)):
+                for step_index, t in enumerate(tqdm(timesteps)):
+                    if os.getenv("SCAIL2_FSDP_DIAGNOSTICS") == "1":
+                        allocated = torch.cuda.memory_allocated(self.device) / 2**20
+                        reserved = torch.cuda.memory_reserved(self.device) / 2**20
+                        print(
+                            " ".join(
+                                [
+                                    "SCAIL2_FSDP_DIAG",
+                                    f"rank={self.rank}",
+                                    "stage=step_pre",
+                                    f"step={step_index + 1}",
+                                    f"allocated_mib={allocated:.1f}",
+                                    f"reserved_mib={reserved:.1f}",
+                                ]
+                            ),
+                            file=sys.stderr,
+                            flush=True,
+                        )
                     latent_model_input = [apply_clean_history(latent.to(self.device), history_latent)]
                     timestep = [t]
 

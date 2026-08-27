@@ -108,7 +108,9 @@ class EngineConfig:
     distributed_backend: str = "nccl"
     initialize_process_group: bool = True
     t5_fsdp: bool = True
+    t5_meta_load: bool = False
     dit_fsdp: bool = True
+    dit_meta_load: bool = False
     t5_cpu: bool = False
     offload_model: bool = False
     output_audio_mode: str = "none"

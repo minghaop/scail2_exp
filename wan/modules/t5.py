@@ -2,6 +2,7 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import logging
 import math
+import time
 
 import torch
 import torch.nn as nn
@@ -479,6 +480,8 @@ class T5EncoderModel:
         checkpoint_path=None,
         tokenizer_path=None,
         shard_fn=None,
+        meta_load=False,
+        init_event=None,
     ):
         self.text_len = text_len
         self.dtype = dtype
@@ -486,22 +489,101 @@ class T5EncoderModel:
         self.checkpoint_path = checkpoint_path
         self.tokenizer_path = tokenizer_path
 
+        def emit(stage, status, started_at=None, **details):
+            if init_event is not None:
+                init_event(stage, status, started_at=started_at, **details)
+
         # init model
+        construct_started = time.monotonic()
+        emit(
+            "t5_model_construct",
+            "start",
+            load_mode="meta_assign" if meta_load else "standard",
+        )
         model = umt5_xxl(
             encoder_only=True,
             return_tokenizer=False,
             dtype=dtype,
-            device=device).eval().requires_grad_(False)
+            device=torch.device("meta") if meta_load else device,
+        ).eval().requires_grad_(False)
+        emit(
+            "t5_model_construct",
+            "complete",
+            started_at=construct_started,
+            load_mode="meta_assign" if meta_load else "standard",
+        )
         logging.info(f'loading {checkpoint_path}')
-        model.load_state_dict(torch.load(checkpoint_path, map_location='cpu'))
+        checkpoint_started = time.monotonic()
+        emit(
+            "t5_checkpoint_read",
+            "start",
+            mmap=meta_load,
+            weights_only=meta_load,
+        )
+        load_kwargs = {"map_location": "cpu"}
+        if meta_load:
+            load_kwargs.update(weights_only=True, mmap=True)
+        state_dict = torch.load(checkpoint_path, **load_kwargs)
+        emit(
+            "t5_checkpoint_read",
+            "complete",
+            started_at=checkpoint_started,
+            mmap=meta_load,
+            weights_only=meta_load,
+        )
+        assign_started = time.monotonic()
+        emit("t5_checkpoint_assign", "start", assign=meta_load)
+        model.load_state_dict(state_dict, strict=True, assign=meta_load)
+        emit(
+            "t5_checkpoint_assign",
+            "complete",
+            started_at=assign_started,
+            assign=meta_load,
+        )
+        del state_dict
+        if meta_load:
+            remaining_meta = [
+                name for name, parameter in model.named_parameters()
+                if parameter.is_meta
+            ]
+            remaining_meta.extend(
+                name for name, buffer in model.named_buffers() if buffer.is_meta
+            )
+            if remaining_meta:
+                examples = ", ".join(remaining_meta[:8])
+                raise RuntimeError(
+                    "T5 checkpoint assignment left meta tensors: " + examples
+                )
         self.model = model
         if shard_fn is not None:
+            fsdp_started = time.monotonic()
+            emit("t5_fsdp_wrap", "start", sync_module_states=False)
             self.model = shard_fn(self.model, sync_module_states=False)
+            emit(
+                "t5_fsdp_wrap",
+                "complete",
+                started_at=fsdp_started,
+                sync_module_states=False,
+            )
         else:
+            placement_started = time.monotonic()
+            emit("t5_device_placement", "start")
             self.model.to(self.device)
+            emit(
+                "t5_device_placement",
+                "complete",
+                started_at=placement_started,
+            )
         # init tokenizer
+        tokenizer_started = time.monotonic()
+        emit("t5_tokenizer_load", "start")
         self.tokenizer = HuggingfaceTokenizer(
             name=tokenizer_path, seq_len=text_len, clean='whitespace')
+        emit(
+            "t5_tokenizer_load",
+            "complete",
+            started_at=tokenizer_started,
+        )
 
     def __call__(self, texts, device):
         ids, mask = self.tokenizer(

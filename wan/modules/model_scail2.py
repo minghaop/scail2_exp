@@ -634,19 +634,24 @@ class SCAIL2Model(ModelMixin, ConfigMixin):
         # buffers (don't use register_buffer otherwise dtype will be changed in to())
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
         d = dim // num_heads
-        self.freqs = torch.cat([
-            rope_params(8192, d - 4 * (d // 6)),
-            rope_params(8192, 2 * (d // 6)),
-            rope_params(8192, 2 * (d // 6))
-        ],
-                               dim=1)
         self.hidden_size_head = d
+        self.freqs = self._make_freqs()
 
         if model_type == 'i2v' or model_type == 'flf2v':
             self.img_emb = MLPProj(1280, dim, flf_pos_emb=model_type == 'flf2v')
 
         # initialize weights
         self.init_weights()
+
+    def _make_freqs(self):
+        """Build the non-persistent RoPE tensor on the active default device."""
+        d = self.hidden_size_head
+        return torch.cat([
+            rope_params(8192, d - 4 * (d // 6)),
+            rope_params(8192, 2 * (d // 6)),
+            rope_params(8192, 2 * (d // 6))
+        ],
+                               dim=1)
 
     def apply_i2v_ones_masks(self, inputs: torch.Tensor, mask_dim: int = 4):
         b, d, t, h, w= inputs.shape
