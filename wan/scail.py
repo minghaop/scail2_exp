@@ -12,7 +12,6 @@ from functools import partial
 
 import numpy as np
 import torch
-import torch.cuda.amp as amp
 import torch.distributed as dist
 import torchvision.transforms.functional as TF
 import torch.nn.functional as F
@@ -314,8 +313,22 @@ class SCAIL2Pipeline:
             )
         # Fail on a wrong, mixed, or quantized checkpoint before loading T5,
         # VAE, CLIP, or any multi-GiB tensor payload.
+        checkpoint_header_started = time.monotonic()
+        _emit_pipeline_init_event(
+            self.rank,
+            "dit_checkpoint_header",
+            "start",
+            checkpoint_bytes=os.path.getsize(scail_safetensors_path),
+        )
         self.scail_checkpoint_header = validate_scail_checkpoint_header(
             scail_safetensors_path, self.dit_resident_dtype
+        )
+        _emit_pipeline_init_event(
+            self.rank,
+            "dit_checkpoint_header",
+            "complete",
+            started_at=checkpoint_header_started,
+            tensor_count=self.scail_checkpoint_header["tensor_count"],
         )
         logging.info(
             "Validated SCAIL header: %d tensors, %d floating tensors, %d "
@@ -330,38 +343,101 @@ class SCAIL2Pipeline:
         self.param_dtype = config.param_dtype
 
         shard_fn = partial(shard_model, device_id=device_id)
+        t5_checkpoint_path = os.path.join(
+            checkpoint_dir, config.t5_checkpoint
+        )
+        t5_started = time.monotonic()
+        _emit_pipeline_init_event(
+            self.rank,
+            "t5_load",
+            "start",
+            checkpoint_bytes=os.path.getsize(t5_checkpoint_path),
+            fsdp=t5_fsdp,
+        )
         self.text_encoder = T5EncoderModel(
             text_len=config.text_len,
             dtype=config.t5_dtype,
             device=torch.device('cpu'),
-            checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
+            checkpoint_path=t5_checkpoint_path,
             tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
             shard_fn=shard_fn if t5_fsdp else None,
+        )
+        _emit_pipeline_init_event(
+            self.rank,
+            "t5_load",
+            "complete",
+            started_at=t5_started,
+            fsdp=t5_fsdp,
         )
 
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
+        vae_checkpoint_path = os.path.join(
+            checkpoint_dir, config.vae_checkpoint
+        )
+        vae_started = time.monotonic()
+        _emit_pipeline_init_event(
+            self.rank,
+            "vae_load",
+            "start",
+            checkpoint_bytes=os.path.getsize(vae_checkpoint_path),
+        )
         self.vae = WanVAE(
-            vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
+            vae_pth=vae_checkpoint_path,
             device=self.device)
+        _emit_pipeline_init_event(
+            self.rank,
+            "vae_load",
+            "complete",
+            started_at=vae_started,
+        )
 
+        clip_checkpoint_path = os.path.join(
+            checkpoint_dir, config.clip_checkpoint
+        )
+        clip_started = time.monotonic()
+        _emit_pipeline_init_event(
+            self.rank,
+            "clip_load",
+            "start",
+            checkpoint_bytes=os.path.getsize(clip_checkpoint_path),
+        )
         self.clip = CLIPModel(
             dtype=config.clip_dtype,
             device=self.device,
-            checkpoint_path=os.path.join(checkpoint_dir,
-                                         config.clip_checkpoint),
+            checkpoint_path=clip_checkpoint_path,
             tokenizer_path=os.path.join(checkpoint_dir, config.clip_tokenizer))
+        _emit_pipeline_init_event(
+            self.rank,
+            "clip_load",
+            "complete",
+            started_at=clip_started,
+        )
 
         logging.info(
             "Creating WanSCAILModel from %s with %s resident parameters",
             scail_safetensors_path,
             self.dit_resident_dtype_name,
         )
+        dit_construct_started = time.monotonic()
+        _emit_pipeline_init_event(
+            self.rank,
+            "dit_model_construct",
+            "start",
+            resident_dtype=self.dit_resident_dtype_name,
+        )
         self.model = SCAIL2Model.from_config(scail_config_path)
         # Cast the empty CPU model before loading so a BF16 checkpoint is never
         # expanded into an additional FP32 parameter copy by load_state_dict.
         if self.dit_resident_dtype != torch.float32:
             self.model.to(dtype=self.dit_resident_dtype)
+        _emit_pipeline_init_event(
+            self.rank,
+            "dit_model_construct",
+            "complete",
+            started_at=dit_construct_started,
+            resident_dtype=self.dit_resident_dtype_name,
+        )
         state_dict = None
         checkpoint_copy_started = time.monotonic()
         _emit_pipeline_init_event(
@@ -687,7 +763,9 @@ class SCAIL2Pipeline:
         output_segments = []
         prev_history_latent = None
 
-        with amp.autocast(dtype=self.param_dtype), torch.no_grad(), no_sync():
+        with torch.amp.autocast(
+            "cuda", dtype=self.param_dtype
+        ), torch.no_grad(), no_sync():
 
             def build_sample_scheduler():
                 if sample_solver == 'unipc':
