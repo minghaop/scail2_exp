@@ -1,0 +1,76 @@
+schema: scail2-environment-contract-v1
+
+validated_runtime:
+  python: "3.10.x"
+  torch: "2.7.0+cu126"
+  torchvision: "0.22.0+cu126"
+  torch_cuda: "12.6"
+  cudnn: "9.5.1 (runtime code 90501)"
+  flash_attention: "2.8.3.post1"
+  imageio_ffmpeg: "0.6.0"
+  bundled_ffmpeg: "7.0.2-static"
+  fastapi: "0.139.0"
+  uvicorn: "0.51.0"
+
+worker:
+  processes: 2
+  visible_gpus: 2
+  backend: nccl
+  model_resident: true
+  offload_model: false
+  concurrent_jobs_per_worker: 1
+  nccl_heartbeat_timeout_seconds: 1800
+  control_backend: gloo
+  control_heartbeat_seconds: 1
+  expected_idle_gpu_utilization: near_zero
+  output_audio_mode: driving
+  output_audio_codec: aac
+  generated_video_reencoded_during_audio_mux: false
+
+http_service:
+  rank: 0
+  container_listen_address: 0.0.0.0
+  listen_port: 8000
+  max_queued_jobs: 8
+  request_fields:
+    - reference_image
+    - reference_mask
+    - driving_video
+    - driving_mask
+    - prompt
+  health_endpoint: /v1/health
+  submit_endpoint: /v1/jobs
+
+gpu:
+  validated_model: NVIDIA A100-SXM4-40GB
+  minimum_memory_gb: 40
+  minimum_compute_capability: "8.0"
+  resident_dtype: bf16
+
+host_requirements:
+  - NVIDIA driver compatible with CUDA 12.6 containers
+  - Podman GPU device/CDI configuration
+  - sufficient shared memory and IPC for two-rank NCCL
+  - readable model mount and writable output mount
+
+container_commands:
+  - ffmpeg
+  - ffprobe
+
+startup_gate:
+  command: scail2-runtime-info --expected-gpu-count 2
+  ready_after:
+    - environment validation
+    - checkpoint validation
+    - two-rank process-group initialization
+    - model load
+    - worker synchronization
+    - Gloo control-group initialization
+  engine_ready_log: SCAIL2_WORKER_READY
+  ready_log: SCAIL2_FASTAPI_READY
+
+nccl_smoke_gate:
+  command: torchrun --standalone --nproc_per_node=2 /opt/scail2/nccl_smoke.py
+  tensor_mib_per_rank: 1024
+  iterations: 3
+  expected_log: NCCL_SMOKE_PASS

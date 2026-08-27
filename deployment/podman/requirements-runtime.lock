@@ -1,0 +1,20 @@
+# Direct Python runtime versions from the environment that produced the
+# byte-identical 116-video BF16 validation run. Torch, Torchvision and
+# FlashAttention are deliberately installed by the CUDA base image/build step.
+accelerate==1.14.0
+decord==0.6.0
+diffusers==0.39.0
+easydict==1.13
+einops==0.8.2
+ftfy==6.3.1
+imageio==2.37.3
+imageio-ffmpeg==0.6.0
+numpy==1.26.4
+Pillow==11.3.0
+safetensors==0.8.0
+sentencepiece==0.2.2
+tokenizers==0.22.2
+tqdm==4.68.3
+transformers==5.13.0
+fastapi==0.139.0
+uvicorn==0.51.0

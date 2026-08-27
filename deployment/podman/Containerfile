@@ -1,0 +1,64 @@
+# Reference build for one persistent two-GPU SCAIL-2 worker. Production should
+# mirror every artifact internally and pin the CUDA base by registry digest.
+ARG BASE_IMAGE=docker.io/nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04
+FROM ${BASE_IMAGE}
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    TOKENIZERS_PARALLELISM=false \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
+    NCCL_IB_DISABLE=1 \
+    NCCL_DEBUG=WARN
+
+RUN apt-get -o APT::Sandbox::User=root update \
+    && apt-get -o APT::Sandbox::User=root install -y --no-install-recommends \
+        python3.10 \
+        python3-pip \
+        python3.10-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY dist/ffmpeg-7.0.2-static /usr/local/bin/ffmpeg
+COPY dist/ffprobe-7.0.2-static /usr/local/bin/ffprobe
+COPY dist/ffmpeg-7.0.2-static-GPLv3.txt /usr/share/licenses/ffmpeg-static/GPLv3.txt
+RUN echo "e7e7fb30477f717e6f55f9180a70386c62677ef8a4d4d1a5d948f4098aa3eb99  /usr/local/bin/ffmpeg" | sha256sum -c - \
+    && echo "4f231a1960d83e403d08f7971e271707bec278a9ae18e21b8b5b03186668450d  /usr/local/bin/ffprobe" | sha256sum -c - \
+    && chmod 0755 /usr/local/bin/ffmpeg /usr/local/bin/ffprobe
+
+RUN python3.10 -m pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && python3.10 -m pip install --no-cache-dir \
+        --index-url https://download.pytorch.org/whl/cu126 \
+        torch==2.7.0+cu126 torchvision==0.22.0+cu126 \
+    && python3.10 -m pip install --no-cache-dir packaging ninja
+
+WORKDIR /opt/scail2
+COPY deployment/podman/requirements-runtime.lock ./requirements-runtime.lock
+RUN python3.10 -m pip install --no-cache-dir -r requirements-runtime.lock \
+    && python3.10 -m pip install --no-cache-dir --no-build-isolation flash-attn==2.8.3.post1
+
+# Build the wheel first with: python -m pip wheel --no-deps -w dist .
+ARG SCAIL2_WHEEL=scail2_inference-0.1.3-py3-none-any.whl
+COPY dist/${SCAIL2_WHEEL} /opt/scail2/${SCAIL2_WHEEL}
+COPY deployment/podman/verify_pip_check.py /opt/scail2/verify_pip_check.py
+RUN python3.10 -m pip install --no-cache-dir --no-deps /opt/scail2/${SCAIL2_WHEEL} \
+    && python3.10 /opt/scail2/verify_pip_check.py
+
+# The deployment service supplies its own module here. One container represents
+# one torchrun worker and must see exactly two GPUs.
+COPY examples/scail2_worker_service.py /opt/scail2/scail2_worker_service.py
+COPY examples/scail2_fastapi_service.py /opt/scail2/scail2_fastapi_service.py
+COPY deployment/podman/nccl_smoke.py /opt/scail2/nccl_smoke.py
+ARG WORKER_MODULE=scail2_fastapi_service
+ENV SCAIL2_WORKER_MODULE=${WORKER_MODULE} \
+    TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=1800 \
+    SCAIL2_INPUT_DIR=/inputs \
+    SCAIL2_OUTPUT_DIR=/outputs \
+    SCAIL2_HTTP_HOST=0.0.0.0 \
+    SCAIL2_HTTP_PORT=8000 \
+    SCAIL2_OUTPUT_AUDIO_MODE=driving \
+    SCAIL2_MAX_QUEUE_SIZE=8 \
+    SCAIL2_CONTROL_HEARTBEAT_SECONDS=1 \
+    SCAIL2_CONTROL_TIMEOUT_SECONDS=120
+EXPOSE 8000
+ENTRYPOINT ["/bin/bash", "-lc"]
+CMD ["scail2-runtime-info --expected-gpu-count 2 && exec torchrun --standalone --nproc_per_node=2 -m ${SCAIL2_WORKER_MODULE}"]

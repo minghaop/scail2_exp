@@ -1,0 +1,37 @@
+schema: scail2-model-manifest-v1
+model_id: scail2-lightx2v-r128-dpo-bf16-v1
+profile: scail2-512p-bf16-v1
+
+dit:
+  relative_path: derived/SCAIL-2-lightx2v-r128-dpo-alpha1-full-bf16.safetensors
+  bytes: 32791228224
+  sha256: 4f2514403f6d2b36050f4accc8761f3c9f52831210bdd9b92178619a34df93d1
+  tensors: 1307
+  parameters: 16395544384
+  dtype: BF16
+
+# The auxiliary files remain in the official SCAIL-2 checkpoint directory.
+auxiliary:
+  release_checksums_status: complete
+  files:
+    - relative_path: umt5-xxl/models_t5_umt5-xxl-enc-bf16.pth
+      bytes: 11361920418
+      sha256: 7cace0da2b446bbbbc57d031ab6cf163a3d59b366da94e5afe36745b746fd81d
+    - relative_path: Wan2.1_VAE.pth
+      bytes: 507609880
+      sha256: 38071ab59bd94681c686fa51d75a1968f64e470262043be31f7a094e442fd981
+    - relative_path: models_clip_open-clip-xlm-roberta-large-vit-huge-14-onlyvisual.pth
+      bytes: 2528485611
+      sha256: 020daacf4c0ce94284df584d243cefb6ddfadefff8772226a8e85431df5de2da
+    - relative_path: umt5-xxl/special_tokens_map.json
+      bytes: 6623
+      sha256: 7b8a9f5040adb67b5805abdfd42c1f8d0f3d0e711f10726580eb3789cd0ad61d
+    - relative_path: umt5-xxl/spiece.model
+      bytes: 4548313
+      sha256: e3909a67b780650b35cf529ac782ad2b6b26e6d1f849d3fbb6a872905f452458
+    - relative_path: umt5-xxl/tokenizer.json
+      bytes: 16837417
+      sha256: 6e197b4d3dbd71da14b4eb255f4fa91c9c1f2068b20a2de2472967ca3d22602b
+    - relative_path: umt5-xxl/tokenizer_config.json
+      bytes: 61728
+      sha256: ed9a3a8b0faa71a70a32847e0435fe036e6e112d4df4edb7bb48a921e344dc05
