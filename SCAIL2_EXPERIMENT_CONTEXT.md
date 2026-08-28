@@ -490,3 +490,15 @@ wan/distributed/fsdp.py，以及 experiment_logs 下的两份日志。
 - 约 27G 的 DiT 设备占用可拆为约 23734.1 MiB live allocated、2607.9 MiB allocator cached/unallocated 和 1124.8 MiB CUDA context/NCCL/库/驱动占用。此前 block 0 报告与外部监控不一致的主要原因由此确认：统计范围和指标口径均不同。
 - 全任务最高点不是 DiT，而是仅由 rank 0/物理 GPU 2 执行的 segment 1 VAE decode：peak allocated=25617.3 MiB、reserved=28600 MiB、同步 device used=29724.8 MiB，200 ms NVML 峰值=29725 MiB。物理 GPU 3 不执行 decode，全任务 NVML 峰值保持为 DiT 阶段的 27467 MiB。
 - 详细分阶段数据、每个 segment/step 的 DiT 峰值和 VAE 分解见 `SCAIL2_FULL_MEMORY_PROFILE_REPORT.md`。若后续目标是降低 DiT live tensor，应继续处理后续 block FP32 residual 和多个约 23 GiB 的 attention 峰值；若目标是降低整条任务物理显存峰值，则 VAE decode 与常驻 DiT shard 的重叠优先级更高。
+
+## 32. 单 segment VAE decode 逐操作显存剖析（2026-08-28）
+
+- 新增 `--vae-memory-profile`：只执行第一个 81 帧 segment，但保留完整 6 步 diffusion、21 个 latent 时间步的 VAE decode 和短视频输出；父进程继续以 200 ms 采集 NVML。该模式绕过正式 297 帧输出的发布/音频校验，专用于实验。
+- 首次日志 `101-20260828-172328.log` 已完整采集 VAE 数据，但单 segment 仍触发 297 帧校验，导致 rank 0 异常后与 rank 1 barrier 不对称等待；手动终止后无残留进程。随后修正实验模式结束路径，并把逐操作埋点限制为 decode 阶段，避免干扰 reference/pose encode。
+- 有效日志为 `experiment_logs/fsdp_baseline/101-20260828-173206.log`；输出 `experiment_outputs/fsdp_baseline/101-20260828-173206.mp4` 已验证为 H.264、512x896、30 fps、81 帧，SHA-256=`8af1377b5c162c70502bbfd9657c5723c3313cd32e34df9f509e90f5d0471a6b`。进程正常退出，GPU 2、3 回到 0 MiB/0%，volatile uncorrected ECC=0。
+- decode 开始 allocated=16654.5 MiB；最后时间步的 32 个 causal cache 合计 4137.875 MiB，累计 77 帧输出为 404.250 MiB。稳定 cache 按分辨率为 112x64: 231.875、224x128: 546、448x256: 1008、896x512: 2352 MiB。
+- 896x512 residual causal conv 是 live allocated 最高点：当前 allocated=24581.2 MiB，operation peak=25596.3 MiB。时间 cat 后 allocated=23903.0；pad 返回后为 23909.2、pad operation peak=24917.2，精确确认 1008 MiB cat 只在 pad 执行时与 1014.196 MiB padded tensor 重叠，返回后已释放。
+- 最终 causal conv 的 padded input 1014.196 MiB、output 672 MiB 和约 1015.1 MiB cuDNN workspace 形成最高峰。最终输出累积 `cat` 的 operation peak 仅 21661.2 MiB，不是主要矛盾。clear cache 后 allocated 从 21236.0 降至 17098.1 MiB，与释放 4137.875 MiB cache 完全吻合。
+- 本轮 NVML 峰值为物理 GPU 2 的 29785 MiB；不 decode 的 GPU 3 为 27467 MiB。详细阶段表、cache 分布和 allocator/device 口径解释已补充到 `SCAIL2_FULL_MEMORY_PROFILE_REPORT.md`。
+- 另新增面向 buffer 生命周期的独立报告 `SCAIL2_VAE_MEMORY_PROFILE_REPORT.md`，逐项列出 latent、各分辨率 feature、32 个 causal cache、temporal cat、padded input、卷积输出/workspace、空间上采样和 21 步输出累计；该报告与完整推理总览分开，避免将设备峰值报告与 VAE buffer 报告混为一体。
+- 按后续决定暂不修改 VAE；数据采集完成后已移除 `--vae-memory-profile`、单 segment 特殊路径、NVML/profile 环境开关和 `wan/modules/vae.py` 中全部同步埋点。`run_fsdp_experiment.py`、`wan/scail.py`、`wan/modules/vae.py` 已与 profiling 前的 Git 版本完全一致；原始日志和报告作为实验记录保留。

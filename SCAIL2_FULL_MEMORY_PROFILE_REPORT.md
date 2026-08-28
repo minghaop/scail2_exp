@@ -119,6 +119,10 @@ VAE decode 开始前已经执行 `gc.collect()`、`torch.cuda.synchronize()` 和
 
 因此 VAE 峰值不是前一个 DiT allocator 缓存未清理造成的，而是 replicated VAE decode 激活与仍常驻的 DiT FSDP shard 叠加造成的真实峰值。
 
+### 6.1 单 segment VAE decode 精细剖析
+
+后续单 segment 实验曾用临时埋点把 VAE decode 细化到每个 latent 时间步、分辨率、causal cache、temporal cat、padding、卷积 workspace、空间上采样和输出累计。全部明细单独整理在 `SCAIL2_VAE_MEMORY_PROFILE_REPORT.md`；对应日志为 `experiment_logs/fsdp_baseline/101-20260828-173206.log`。数据采集完成后，临时 profiling 入口和 VAE 内部埋点已从运行时代码移除。
+
 ## 7. DiT block 0 与后续 block 的差异
 
 segment 1 / step 1 的实测值：
