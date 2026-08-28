@@ -72,6 +72,25 @@ def parse_args() -> argparse.Namespace:
         help="Enable block-level FSDP/NCCL diagnostics and a 120-second timeout.",
     )
     parser.add_argument(
+        "--memory-probe",
+        action="store_true",
+        help=(
+            "Run only segment 1 / diffusion step 1 without VAE decode or output, "
+            "and log detailed block-0 CUDA memory peaks."
+        ),
+    )
+    parser.add_argument(
+        "--ffn-chunk-size",
+        type=int,
+        default=0,
+        help="Experimentally process the DiT FFN in token chunks; 0 disables it.",
+    )
+    parser.add_argument(
+        "--bf16-residual",
+        action="store_true",
+        help="Experimentally retain inter-block DiT residuals in BF16.",
+    )
+    parser.add_argument(
         "--expandable-segments",
         action="store_true",
         help="Enable PyTorch CUDA allocator expandable segments.",
@@ -151,6 +170,8 @@ def resolved_payload(args: argparse.Namespace) -> dict[str, object]:
             "Experiments may use only physical GPUs 0,1,2,3,6,7; "
             f"got {physical_gpus}"
         )
+    if args.ffn_chunk_size < 0:
+        raise ValueError("--ffn-chunk-size must be nonnegative")
     return {
         "case": TEST_CASE,
         "job_id": job_id,
@@ -159,6 +180,9 @@ def resolved_payload(args: argparse.Namespace) -> dict[str, object]:
         "overwrite": args.overwrite,
         "init_only": args.init_only,
         "diagnose_fsdp": args.diagnose_fsdp,
+        "memory_probe": args.memory_probe,
+        "ffn_chunk_size": args.ffn_chunk_size,
+        "bf16_residual": args.bf16_residual,
         "expandable_segments": args.expandable_segments,
         "profile": PROFILE_NAME,
         "checkpoint_dir": CHECKPOINT_DIR,
@@ -256,6 +280,12 @@ def launch_workers(payload: dict[str, object]) -> None:
                 "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",
             }
         )
+    if payload["memory_probe"]:
+        env["SCAIL2_DIT_MEMORY_DIAGNOSTICS"] = "1"
+    if payload["ffn_chunk_size"]:
+        env["SCAIL2_FFN_CHUNK_SIZE"] = str(payload["ffn_chunk_size"])
+    if payload["bf16_residual"]:
+        env["SCAIL2_BF16_RESIDUAL"] = "1"
     if payload["expandable_segments"]:
         env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -295,6 +325,9 @@ def launch_workers(payload: dict[str, object]) -> None:
             else "Load modes: T5=meta-assign, CLIP=standard, DiT=meta-assign\n"
         )
         + f"FSDP diagnostics: {'enabled' if payload['diagnose_fsdp'] else 'disabled'}\n"
+        + f"DiT memory probe: {'enabled' if payload['memory_probe'] else 'disabled'}\n"
+        + f"FFN chunk size: {payload['ffn_chunk_size']}\n"
+        + f"BF16 residual: {'enabled' if payload['bf16_residual'] else 'disabled'}\n"
         + f"Expandable segments: {'enabled' if payload['expandable_segments'] else 'disabled'}\n"
         + " ".join(command)
         + "\n"
@@ -404,6 +437,29 @@ def run_worker(args: argparse.Namespace, payload: dict[str, object]) -> None:
                         {
                             "job_id": str(payload["job_id"]),
                             "status": "initialized",
+                            "profile": str(payload["profile"]),
+                            "world_size": 2,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    flush=True,
+                )
+            return
+        if args.memory_probe:
+            normalized_job, _ = engine._normalize_job(job)
+            engine._run_generation(
+                normalized_job,
+                temp_output=Path(payload["output"]),
+                seed=int(payload["seed"]),
+                diagnostic_memory_probe=True,
+            )
+            if engine.is_primary:
+                print(
+                    json.dumps(
+                        {
+                            "job_id": str(payload["job_id"]),
+                            "status": "memory_probe_complete",
                             "profile": str(payload["profile"]),
                             "world_size": 2,
                         },

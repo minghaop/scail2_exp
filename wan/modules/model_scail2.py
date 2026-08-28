@@ -1,5 +1,7 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import math
+import os
+import sys
 
 import torch
 import torch.nn as nn
@@ -13,6 +15,48 @@ __all__ = ['SCAILModel']
 
 T5_CONTEXT_TOKEN_NUMBER = 512
 FIRST_LAST_FRAME_CONTEXT_TOKEN_NUMBER = 257 * 2
+
+
+def _memory_probe_enabled(module) -> bool:
+    """Return whether detailed CUDA memory logging applies to this block."""
+    if os.getenv("SCAIL2_DIT_MEMORY_DIAGNOSTICS") != "1":
+        return False
+    return getattr(module, "_scail2_block_index", None) == 0
+
+
+def _memory_probe_begin(module):
+    if not _memory_probe_enabled(module):
+        return None
+    device = torch.cuda.current_device()
+    torch.cuda.reset_peak_memory_stats(device)
+    return torch.cuda.memory_allocated(device)
+
+
+def _memory_probe_end(module, stage, allocated_before, tensor=None):
+    if allocated_before is None:
+        return
+    device = torch.cuda.current_device()
+    allocated = torch.cuda.memory_allocated(device)
+    reserved = torch.cuda.memory_reserved(device)
+    peak = torch.cuda.max_memory_allocated(device)
+    fields = [
+        "SCAIL2_DIT_MEMORY",
+        f"rank={os.getenv('RANK', '0')}",
+        f"block={getattr(module, '_scail2_block_index', -1)}",
+        f"stage={stage}",
+        f"allocated_mib={allocated / 2**20:.1f}",
+        f"reserved_mib={reserved / 2**20:.1f}",
+        f"phase_peak_mib={peak / 2**20:.1f}",
+        f"phase_increase_mib={max(0, peak - allocated_before) / 2**20:.1f}",
+    ]
+    if tensor is not None:
+        fields.extend(
+            [
+                f"shape={tuple(tensor.shape)}",
+                f"dtype={str(tensor.dtype).removeprefix('torch.')}",
+            ]
+        )
+    print(" ".join(fields), file=sys.stderr, flush=True)
 
 
 def sinusoidal_embedding_1d(dim, position):
@@ -76,7 +120,10 @@ def rope_apply_ref(x, freqs, **kwargs):
 
         # append to collection
         output.append(x_i)
-    return torch.stack(output).float()
+    # FlashAttention immediately converts Q/K to a half dtype. Returning the
+    # input dtype here avoids retaining FP32 Q/K and a redundant FP32 attention
+    # output that the following autocast linear would cast back to BF16.
+    return torch.stack(output).to(dtype=x.dtype)
 
 @torch.amp.autocast("cuda", enabled=False)
 def rope_apply_additional_ref(x, freqs, **kwargs):
@@ -120,7 +167,7 @@ def rope_apply_video(x, freqs, **kwargs):
 
         # append to collection
         output.append(x_i)
-    return torch.stack(output).float()
+    return torch.stack(output).to(dtype=x.dtype)
 
 @torch.amp.autocast("cuda", enabled=False)
 def rope_apply_pose(x, freqs, **kwargs):
@@ -177,7 +224,7 @@ def rope_apply_pose(x, freqs, **kwargs):
 
         # append to collection
         output.append(x_i)
-    return torch.stack(output).float()
+    return torch.stack(output).to(dtype=x.dtype)
 
 def rope_apply_scail(x, **kwargs):
     """
@@ -289,18 +336,33 @@ class WanSelfAttention(nn.Module):
             v = self.v(x).view(b, s, n, d)
             return q, k, v
 
+        memory_before = _memory_probe_begin(self)
         q, k, v = qkv_fn(x)
+        _memory_probe_end(self, "self_qkv", memory_before, q)
 
+        memory_before = _memory_probe_begin(self)
+        q_rope = rope_apply_func(q)
+        _memory_probe_end(self, "self_q_rope", memory_before, q_rope)
+
+        memory_before = _memory_probe_begin(self)
+        k_rope = rope_apply_func(k)
+        _memory_probe_end(self, "self_k_rope", memory_before, k_rope)
+
+        memory_before = _memory_probe_begin(self)
         x = flash_attention(
-            q=rope_apply_func(q),
-            k=rope_apply_func(k),
+            q=q_rope,
+            k=k_rope,
             v=v,
             k_lens=seq_lens,
             window_size=self.window_size)
+        _memory_probe_end(self, "self_flash_attention", memory_before, x)
+        del q_rope, k_rope
 
         # output
         x = x.flatten(2)
+        memory_before = _memory_probe_begin(self)
         x = self.o(x)
+        _memory_probe_end(self, "self_output_projection", memory_before, x)
         return x
 
 
@@ -357,20 +419,32 @@ class WanI2VCrossAttention(WanSelfAttention):
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
         # compute query, key, value
+        memory_before = _memory_probe_begin(self)
         q = self.norm_q(self.q(x)).view(b, -1, n, d)
         k = self.norm_k(self.k(context)).view(b, -1, n, d)
         v = self.v(context).view(b, -1, n, d)
         k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
         v_img = self.v_img(context_img).view(b, -1, n, d)
+        _memory_probe_end(self, "cross_qkv", memory_before, q)
+
+        memory_before = _memory_probe_begin(self)
         img_x = flash_attention(q, k_img, v_img, k_lens=None)
+        _memory_probe_end(self, "cross_image_attention", memory_before, img_x)
         # compute attention
+        memory_before = _memory_probe_begin(self)
         x = flash_attention(q, k, v, k_lens=context_lens)
+        _memory_probe_end(self, "cross_text_attention", memory_before, x)
 
         # output
         x = x.flatten(2)
         img_x = img_x.flatten(2)
-        x = x + img_x
+        memory_before = _memory_probe_begin(self)
+        x.add_(img_x)
+        _memory_probe_end(self, "cross_attention_merge", memory_before, x)
+        del img_x
+        memory_before = _memory_probe_begin(self)
         x = self.o(x)
+        _memory_probe_end(self, "cross_output_projection", memory_before, x)
         return x
 
 
@@ -443,17 +517,80 @@ class WanAttentionBlock(nn.Module):
         assert e[0].dtype == torch.float32
 
         # self-attention
-        y = self.self_attn(
-            self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, **kwargs)
+        memory_before = _memory_probe_begin(self)
+        self_attn_input = self.norm1(x).float() * (1 + e[1]) + e[0]
+        _memory_probe_end(
+            self, "self_attention_input", memory_before, self_attn_input
+        )
+        y = self.self_attn(self_attn_input, seq_lens, **kwargs)
+        del self_attn_input
+        memory_before = _memory_probe_begin(self)
         with torch.amp.autocast("cuda", dtype=torch.float32):
             x = x + y * e[2]
+            if os.getenv("SCAIL2_BF16_RESIDUAL") == "1":
+                x = x.to(dtype=y.dtype)
+        _memory_probe_end(self, "self_residual", memory_before, x)
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
-            x = x + self.cross_attn(self.norm3(x), context, context_lens)
-            y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
+            memory_before = _memory_probe_begin(self)
+            cross_output = self.cross_attn(
+                self.norm3(x), context, context_lens
+            )
+            x.add_(cross_output)
+            del cross_output
+            _memory_probe_end(self, "cross_residual", memory_before, x)
+
+            ffn_chunk_size = int(os.getenv("SCAIL2_FFN_CHUNK_SIZE", "0"))
+            if 0 < ffn_chunk_size < x.size(1):
+                memory_before = _memory_probe_begin(self)
+                y = torch.empty_like(x, dtype=self.ffn[2].weight.dtype)
+                for start in range(0, x.size(1), ffn_chunk_size):
+                    end = min(start + ffn_chunk_size, x.size(1))
+                    x_chunk = x[:, start:end]
+                    ffn_input = (
+                        self.norm2(x_chunk).float() * (1 + e[4]) + e[3]
+                    )
+                    ffn_hidden = self.ffn[0](ffn_input)
+                    del ffn_input
+                    ffn_hidden = self.ffn[1](ffn_hidden)
+                    ffn_output = self.ffn[2](ffn_hidden)
+                    del ffn_hidden
+                    y[:, start:end].copy_(ffn_output)
+                    del ffn_output, x_chunk
+                _memory_probe_end(
+                    self,
+                    f"ffn_chunked_{ffn_chunk_size}",
+                    memory_before,
+                    y,
+                )
+            else:
+                memory_before = _memory_probe_begin(self)
+                ffn_input = self.norm2(x).float() * (1 + e[4]) + e[3]
+                _memory_probe_end(self, "ffn_input", memory_before, ffn_input)
+
+                memory_before = _memory_probe_begin(self)
+                ffn_hidden = self.ffn[0](ffn_input)
+                _memory_probe_end(
+                    self, "ffn_linear_1", memory_before, ffn_hidden
+                )
+                del ffn_input
+
+                memory_before = _memory_probe_begin(self)
+                ffn_hidden = self.ffn[1](ffn_hidden)
+                _memory_probe_end(self, "ffn_gelu", memory_before, ffn_hidden)
+
+                memory_before = _memory_probe_begin(self)
+                y = self.ffn[2](ffn_hidden)
+                _memory_probe_end(self, "ffn_linear_2", memory_before, y)
+                del ffn_hidden
+
+            memory_before = _memory_probe_begin(self)
             with torch.amp.autocast("cuda", dtype=torch.float32):
                 x = x + y * e[5]
+                if os.getenv("SCAIL2_BF16_RESIDUAL") == "1":
+                    x = x.to(dtype=y.dtype)
+            _memory_probe_end(self, "ffn_residual", memory_before, x)
             return x
 
         x = cross_attn_ffn(x, context, context_lens, e)
@@ -627,6 +764,10 @@ class SCAIL2Model(ModelMixin, ConfigMixin):
                               window_size, qk_norm, cross_attn_norm, eps)
             for _ in range(num_layers)
         ])
+        for block_index, block in enumerate(self.blocks):
+            block._scail2_block_index = block_index
+            block.self_attn._scail2_block_index = block_index
+            block.cross_attn._scail2_block_index = block_index
 
         # head
         self.head = Head(dim, out_dim, patch_size, eps)

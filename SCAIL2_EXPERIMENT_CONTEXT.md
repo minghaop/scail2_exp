@@ -463,3 +463,15 @@ wan/distributed/fsdp.py，以及 experiment_logs 下的两份日志。
 - 缓存主流程的 ready-to-finished 推理请求耗时为 436.904 秒；原在线 T5/CLIP 流程为 437.707 秒，减少 0.803 秒（0.18%），扩散采样单步速度不变。预处理的主要收益不是单次 DiT 计算加速，而是让主 worker 不再加载/常驻 T5 和 CLIP，并允许缓存跨任务复用。
 - 新旧两次完整输出的 SHA-256 完全相同：`7039c5f231eb64b544c4aa288ea5107411c9e7f51bdcf4c93d125d6e1610680a`。这比仅比较媒体规格更强，确认当前固定 seed、prompt、参考图和输入下，独立预处理没有引入任何输出字节差异。
 - 若把 12.5 秒预处理成本计入只使用一次的任务，总时间不会更快；该结构的价值来自离线/异步预处理、相同 prompt/reference 的复用，以及为单卡主 worker 释放模型显存。`experiment_cache/` 已加入 `.gitignore`。
+
+## 30. DiT 长序列激活显存优化（2026-08-28）
+
+- 新增 `--memory-probe`，只执行首个 81 帧 segment 的第一个 diffusion step，跳过 VAE decode/视频写出；诊断模式记录 block 0 内 self-attention、RoPE、cross-attention 和 FFN 的 allocated/reserved/phase peak，并记录最终 latent SHA-256。GPU 2、3 实验前均为 0 MiB、volatile corrected/uncorrected ECC=0。
+- 缓存 conditioning 后的原始诊断日志为 `experiment_logs/fsdp_baseline/101-20260828-130305.log`。初始 block 0 最高峰为 self-attention 的 26350.1 MiB；RoPE Q/K 单阶段增量为 3746.8 MiB；完整 FFN 的最高绝对值为 24300.5 MiB。基线 latent SHA-256 为 `f6845ee32b24e01bb80b8f6dfa3467c62119bb3014ef94f65718a40bd8085261`。
+- FFN 按 8192 token 分块，同时分块执行 norm/modulation，并预分配 BF16 输出。日志 `101-20260828-130414.log`：FFN 计算峰值从 24300.5 MiB 降至 22515.2 MiB，减少 1785.3 MiB；首步约 17.82 秒，latent SHA-256 与基线完全相同。
+- RoPE 保留 FP64/complex128 内部计算，但直接返回输入 BF16 dtype；FlashAttention 原本也会立即将 Q/K 转为 BF16，因此避免了冗余 FP32 Q/K 和 FP32 attention 返回值。日志 `101-20260828-130545.log`：block 峰值降至 25419.9 MiB，减少 930.2 MiB；reserved 约减少 1.72 GiB；latent SHA-256 仍完全相同。
+- 将 RoPE 内部改为 FP32/complex64 的日志为 `101-20260828-130707.log`，峰值可进一步降至约 23970 MiB、首步约 17.32 秒，但 latent SHA-256 改变，因此已回退，当前继续使用 FP64/complex128。
+- cross-attention 的 image/text 输出合并以及 FP32 block residual 改为安全的原地累加。日志 `101-20260828-130841.log`：cross merge 临时峰值减少 476.9 MiB，cross residual 峰值减少约 477 MiB，后续 allocated 降低约 954 MiB；latent SHA-256 仍完全相同。全局峰值仍由 RoPE 决定。
+- BF16 block residual 的可选实验日志为 `101-20260828-131010.log`。它将 block 间 hidden 从约 953.8 MiB 降至 476.9 MiB，但没有降低由 RoPE 决定的全局峰值，并改变 latent SHA-256，因此默认关闭，仅保留 `--bf16-residual` 实验开关。
+- 无损组合完整回归命令：`python run_fsdp_experiment.py --conditioning-cache experiment_cache/conditioning/101.safetensors --physical-gpus 2,3 --ffn-chunk-size 8192 --expandable-segments`。日志 `experiment_logs/fsdp_baseline/101-20260828-131130.log`，输出 `experiment_outputs/fsdp_baseline/101-20260828-131130.mp4`；297 帧、30 fps、四个 segment 全部成功，未出现 OOM/NCCL/traceback。
+- 优化后 ready-to-finished 为 432.281 秒，缓存 conditioning 基线为 436.904 秒，减少 4.624 秒（1.06%）。新旧 MP4 大小均为 19587416 bytes，SHA-256 均为 `7039c5f231eb64b544c4aa288ea5107411c9e7f51bdcf4c93d125d6e1610680a`，确认完整输出逐字节一致。

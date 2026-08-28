@@ -382,6 +382,7 @@ class Scail2InferenceEngine:
         *,
         temp_output: Path,
         seed: int,
+        diagnostic_memory_probe: bool = False,
     ) -> None:
         """Call the legacy, byte-verified generation adapter."""
         from generate import generate_video
@@ -445,6 +446,7 @@ class Scail2InferenceEngine:
             save_dir=str(job.output_path.parent),
             ring_size=1,
             prompt=job.prompt,
+            diagnostic_memory_probe=diagnostic_memory_probe,
         )
         generate_video(
             self.pipeline,

@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import logging
+import hashlib
 import math
 import os
 import random
@@ -722,6 +723,7 @@ class SCAIL2Pipeline:
                  additional_ref_imgs: list[torch.Tensor] = None,
                  additional_ref_mask_imgs: list[torch.Tensor] = None,
                  conditioning: dict[str, torch.Tensor] = None,
+                 diagnostic_memory_probe: bool = False,
                  **kwargs):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
@@ -825,6 +827,12 @@ class SCAIL2Pipeline:
             segment_overlap=segment_overlap,
             temporal_stride=self.vae_stride[0],
         )
+        if diagnostic_memory_probe:
+            segments = segments[:1]
+            logging.info(
+                "SCAIL2_MEMORY_PROBE limiting execution to segment 1 and "
+                "diffusion step 1; VAE decode and output encoding are disabled."
+            )
         if len(segments) > 1:
             logging.info(
                 f"Sampling {len(segments)} segments with segment_len={segment_len}, "
@@ -1031,6 +1039,8 @@ class SCAIL2Pipeline:
                     f"frames [{seg_start}, {seg_valid_end}), "
                     f"padded_length={segment.padded_frames}")
                 sample_scheduler, timesteps = build_sample_scheduler()
+                if diagnostic_memory_probe:
+                    timesteps = timesteps[:1]
 
                 pose_segment = pose_video[seg_start:seg_valid_end]
                 pad_frames = segment.padded_frames - segment.valid_frames
@@ -1155,6 +1165,25 @@ class SCAIL2Pipeline:
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
 
+                if diagnostic_memory_probe:
+                    probe_tensor = final_latent.detach().to("cpu").contiguous()
+                    probe_bytes = probe_tensor.view(torch.uint8).numpy().tobytes()
+                    logging.info(
+                        "SCAIL2_MEMORY_PROBE latent_shape=%s latent_dtype=%s "
+                        "latent_mean=%.9f latent_std=%.9f latent_sha256=%s",
+                        tuple(probe_tensor.shape),
+                        probe_tensor.dtype,
+                        probe_tensor.float().mean().item(),
+                        probe_tensor.float().std().item(),
+                        hashlib.sha256(probe_bytes).hexdigest(),
+                    )
+                    del probe_tensor, probe_bytes
+                    del final_latent
+                    logging.info(
+                        "SCAIL2_MEMORY_PROBE status=complete segment=1 step=1"
+                    )
+                    break
+
                 # The VAE is replicated rather than sharded. Decode only on
                 # rank 0 after clearing the diffusion inputs. Other ranks can
                 # release their copy of the final latent immediately and wait
@@ -1252,6 +1281,8 @@ class SCAIL2Pipeline:
         if dist.is_initialized():
             dist.barrier()
 
+        if diagnostic_memory_probe:
+            return None
         if self.rank == 0:
             video = torch.cat(output_segments, dim=1)
             if video.shape[1] != num_frames:

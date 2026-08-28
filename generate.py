@@ -354,9 +354,12 @@ def generate_video(pipeline: wan.SCAIL2Pipeline, prompt: str, image_path: str, i
         seed=args.base_seed,
         offload_model=args.offload_model,
         conditioning=conditioning,
+        diagnostic_memory_probe=getattr(args, "diagnostic_memory_probe", False),
         **additional_input
     )
 
+    if getattr(args, "diagnostic_memory_probe", False):
+        return
     if rank == 0:
         if args.save_file is None:
             formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")
