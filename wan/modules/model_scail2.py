@@ -83,6 +83,30 @@ def rope_params(max_seq_len, dim, theta=10000):
     return freqs
 
 
+def _rope_rotate_tokens(x, freqs):
+    """Apply FP64/complex128 RoPE, optionally in bounded token chunks."""
+    chunk_size = int(os.getenv("SCAIL2_ROPE_CHUNK_SIZE", "0"))
+    if chunk_size <= 0 or chunk_size >= x.size(0):
+        x_complex = torch.view_as_complex(
+            x.to(torch.float64).reshape(x.size(0), x.size(1), -1, 2)
+        )
+        return torch.view_as_real(x_complex * freqs).flatten(2)
+
+    output = torch.empty_like(x)
+    for start in range(0, x.size(0), chunk_size):
+        end = min(start + chunk_size, x.size(0))
+        x_chunk = x[start:end].to(torch.float64)
+        x_complex = torch.view_as_complex(
+            x_chunk.reshape(end - start, x.size(1), -1, 2)
+        )
+        rotated = torch.view_as_real(
+            x_complex * freqs[start:end]
+        ).flatten(2)
+        output[start:end].copy_(rotated)
+        del rotated, x_complex, x_chunk
+    return output
+
+
 @torch.amp.autocast("cuda", enabled=False)
 def rope_apply_ref(x, freqs, **kwargs):
     rope_key = kwargs.get("rope_key", "ref")
@@ -105,8 +129,6 @@ def rope_apply_ref(x, freqs, **kwargs):
         assert seq_len == x.size(1)
 
         # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
-            seq_len, n, -1, 2))
         freqs_i = torch.cat([
             freqs[0][shift_f:shift_f+f].view(f, 1, 1, -1).expand(f, h, w, -1),
             freqs[1][shift_h:shift_h+h].view(1, h, 1, -1).expand(f, h, w, -1),
@@ -115,7 +137,7 @@ def rope_apply_ref(x, freqs, **kwargs):
                             dim=-1).reshape(seq_len, 1, -1)
 
         # apply rotary embedding
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+        x_i = _rope_rotate_tokens(x[i, :seq_len], freqs_i)
         x_i = torch.cat([x_i, x[i, seq_len:]])
 
         # append to collection
@@ -152,8 +174,6 @@ def rope_apply_video(x, freqs, **kwargs):
         assert seq_len == x.size(1)
 
         # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
-            seq_len, n, -1, 2))
         freqs_i = torch.cat([
             freqs[0][shift_f:shift_f+f].view(f, 1, 1, -1).expand(f, h, w, -1),
             freqs[1][shift_h:shift_h+h].view(1, h, 1, -1).expand(f, h, w, -1),
@@ -162,7 +182,7 @@ def rope_apply_video(x, freqs, **kwargs):
                             dim=-1).reshape(seq_len, 1, -1)
 
         # apply rotary embedding
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+        x_i = _rope_rotate_tokens(x[i, :seq_len], freqs_i)
         x_i = torch.cat([x_i, x[i, seq_len:]])
 
         # append to collection
@@ -190,8 +210,6 @@ def rope_apply_pose(x, freqs, **kwargs):
         assert seq_len == x.size(1)
 
         # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
-            seq_len, n, -1, 2))
         freqs_i = torch.cat([
             freqs[0][shift_f:shift_f+f].view(f, 1, 1, -1).expand(f, h, w, -1),
             freqs[1][shift_h:shift_h+h].view(1, h, 1, -1).expand(f, h, w, -1),
@@ -219,7 +237,7 @@ def rope_apply_pose(x, freqs, **kwargs):
         freqs_i = freqs_i.reshape(seq_len, 1, -1)
 
         # apply rotary embedding
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+        x_i = _rope_rotate_tokens(x[i, :seq_len], freqs_i)
         x_i = torch.cat([x_i, x[i, seq_len:]])
 
         # append to collection

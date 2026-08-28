@@ -86,6 +86,15 @@ def parse_args() -> argparse.Namespace:
         help="Experimentally process the DiT FFN in token chunks; 0 disables it.",
     )
     parser.add_argument(
+        "--rope-chunk-size",
+        type=int,
+        default=0,
+        help=(
+            "Experimentally apply FP64/complex128 RoPE in token chunks; "
+            "0 disables it."
+        ),
+    )
+    parser.add_argument(
         "--bf16-residual",
         action="store_true",
         help="Experimentally retain inter-block DiT residuals in BF16.",
@@ -172,6 +181,8 @@ def resolved_payload(args: argparse.Namespace) -> dict[str, object]:
         )
     if args.ffn_chunk_size < 0:
         raise ValueError("--ffn-chunk-size must be nonnegative")
+    if args.rope_chunk_size < 0:
+        raise ValueError("--rope-chunk-size must be nonnegative")
     return {
         "case": TEST_CASE,
         "job_id": job_id,
@@ -182,6 +193,7 @@ def resolved_payload(args: argparse.Namespace) -> dict[str, object]:
         "diagnose_fsdp": args.diagnose_fsdp,
         "memory_probe": args.memory_probe,
         "ffn_chunk_size": args.ffn_chunk_size,
+        "rope_chunk_size": args.rope_chunk_size,
         "bf16_residual": args.bf16_residual,
         "expandable_segments": args.expandable_segments,
         "profile": PROFILE_NAME,
@@ -284,6 +296,8 @@ def launch_workers(payload: dict[str, object]) -> None:
         env["SCAIL2_DIT_MEMORY_DIAGNOSTICS"] = "1"
     if payload["ffn_chunk_size"]:
         env["SCAIL2_FFN_CHUNK_SIZE"] = str(payload["ffn_chunk_size"])
+    if payload["rope_chunk_size"]:
+        env["SCAIL2_ROPE_CHUNK_SIZE"] = str(payload["rope_chunk_size"])
     if payload["bf16_residual"]:
         env["SCAIL2_BF16_RESIDUAL"] = "1"
     if payload["expandable_segments"]:
@@ -327,6 +341,7 @@ def launch_workers(payload: dict[str, object]) -> None:
         + f"FSDP diagnostics: {'enabled' if payload['diagnose_fsdp'] else 'disabled'}\n"
         + f"DiT memory probe: {'enabled' if payload['memory_probe'] else 'disabled'}\n"
         + f"FFN chunk size: {payload['ffn_chunk_size']}\n"
+        + f"RoPE chunk size: {payload['rope_chunk_size']}\n"
         + f"BF16 residual: {'enabled' if payload['bf16_residual'] else 'disabled'}\n"
         + f"Expandable segments: {'enabled' if payload['expandable_segments'] else 'disabled'}\n"
         + " ".join(command)
