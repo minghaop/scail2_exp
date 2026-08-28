@@ -355,6 +355,10 @@ def generate_video(pipeline: wan.SCAIL2Pipeline, prompt: str, image_path: str, i
         offload_model=args.offload_model,
         conditioning=conditioning,
         diagnostic_memory_probe=getattr(args, "diagnostic_memory_probe", False),
+        diagnostic_memory_probe_steps=getattr(
+            args, "diagnostic_memory_probe_steps", 1
+        ),
+        diagnostic_segment_limit=getattr(args, "diagnostic_segment_limit", None),
         **additional_input
     )
 

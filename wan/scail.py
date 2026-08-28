@@ -297,6 +297,8 @@ class SCAIL2Pipeline:
         lora_alpha=None,
         dit_resident_dtype="fp32",
         dit_meta_load=False,
+        keep_dit_cpu_state_dict=False,
+        vae_dit_offload_blocks=0,
         t5_meta_load=False,
         precomputed_conditioning=False,
     ):
@@ -330,6 +332,13 @@ class SCAIL2Pipeline:
             dit_meta_load (`bool`, *optional*, defaults to False):
                 Build the DiT structure on the meta device and assign checkpoint
                 tensors directly instead of initializing disposable parameters.
+            keep_dit_cpu_state_dict (`bool`, *optional*, defaults to False):
+                Retain the checkpoint tensors on CPU after placing a non-FSDP
+                DiT on CUDA. This is the master copy for phase-based single-GPU
+                experiments and is not used by the normal FSDP path.
+            vae_dit_offload_blocks (`int`, *optional*, defaults to 0):
+                Number of trailing DiT blocks to replace with CPU-master views
+                during VAE decode/history encode, then rematerialize on CUDA.
             t5_meta_load (`bool`, *optional*, defaults to False):
                 Build T5 on the meta device and directly assign an mmap-backed
                 weights-only checkpoint before FSDP wrapping.
@@ -359,6 +368,10 @@ class SCAIL2Pipeline:
             self.dit_resident_dtype
         )
         self.dit_meta_load = bool(dit_meta_load)
+        self.keep_dit_cpu_state_dict = bool(keep_dit_cpu_state_dict)
+        self.vae_dit_offload_blocks = int(vae_dit_offload_blocks)
+        self.dit_cpu_state_dict = None
+        self.dit_cpu_state_dict_bytes = 0
         self.t5_meta_load = bool(t5_meta_load)
         self.precomputed_conditioning = bool(precomputed_conditioning)
         if self.precomputed_conditioning and t5_fsdp:
@@ -603,8 +616,37 @@ class SCAIL2Pipeline:
                     )
                 if self.model.freqs.is_meta:
                     raise RuntimeError("DiT RoPE frequencies remain on the meta device")
+            if self.keep_dit_cpu_state_dict:
+                if dit_fsdp:
+                    raise ValueError(
+                        "keep_dit_cpu_state_dict is unsupported with dit_fsdp"
+                    )
+                non_cpu_tensors = [
+                    name
+                    for name, tensor in state_dict.items()
+                    if isinstance(tensor, torch.Tensor) and tensor.device.type != "cpu"
+                ]
+                if non_cpu_tensors:
+                    raise RuntimeError(
+                        "DiT CPU master contains non-CPU tensors: "
+                        + ", ".join(non_cpu_tensors[:8])
+                    )
+                self.dit_cpu_state_dict = state_dict
+                self.dit_cpu_state_dict_bytes = sum(
+                    tensor.numel() * tensor.element_size()
+                    for tensor in state_dict.values()
+                    if isinstance(tensor, torch.Tensor)
+                )
+                _emit_pipeline_init_event(
+                    self.rank,
+                    "dit_cpu_master",
+                    "complete",
+                    tensor_count=len(state_dict),
+                    tensor_bytes=self.dit_cpu_state_dict_bytes,
+                )
         finally:
-            del state_dict
+            if not self.keep_dit_cpu_state_dict:
+                del state_dict
             gc.collect()
         _emit_pipeline_init_event(
             self.rank,
@@ -713,6 +755,18 @@ class SCAIL2Pipeline:
                     self.rank, "dit_device_placement", "start"
                 )
                 self.model.to(self.device)
+                if self.dit_cpu_state_dict is not None:
+                    non_cpu_tensors = [
+                        name
+                        for name, tensor in self.dit_cpu_state_dict.items()
+                        if isinstance(tensor, torch.Tensor)
+                        and tensor.device.type != "cpu"
+                    ]
+                    if non_cpu_tensors:
+                        raise RuntimeError(
+                            "DiT CPU master moved during CUDA placement: "
+                            + ", ".join(non_cpu_tensors[:8])
+                        )
                 _emit_pipeline_init_event(
                     self.rank,
                     "dit_device_placement",
@@ -724,8 +778,95 @@ class SCAIL2Pipeline:
             self.dit_resident_dtype,
             "after FSDP/device placement",
         )
+        if self.vae_dit_offload_blocks:
+            if dit_fsdp or self.dit_cpu_state_dict is None:
+                raise ValueError(
+                    "VAE-phase DiT block offload requires non-FSDP CUDA DiT "
+                    "and a retained CPU master"
+                )
+            if not 0 < self.vae_dit_offload_blocks <= len(self.model.blocks):
+                raise ValueError(
+                    "vae_dit_offload_blocks must be between 1 and "
+                    f"{len(self.model.blocks)}"
+                )
+        self._vae_offloaded_dit_blocks = ()
 
         self.sample_neg_prompt = config.sample_neg_prompt
+
+    @staticmethod
+    def _replace_module_parameter(module, name, tensor):
+        parent_name, separator, leaf_name = name.rpartition(".")
+        parent = module.get_submodule(parent_name) if separator else module
+        current = parent._parameters.get(leaf_name)
+        if current is None:
+            raise RuntimeError(f"Missing DiT parameter {name}")
+        replacement = torch.nn.Parameter(
+            tensor,
+            requires_grad=current.requires_grad,
+        )
+        parent._parameters[leaf_name] = replacement
+        return replacement
+
+    def _switch_vae_dit_blocks(self, *, to_cuda):
+        count = self.vae_dit_offload_blocks
+        if not count:
+            return
+        if self.dit_cpu_state_dict is None:
+            raise RuntimeError("DiT CPU master is unavailable")
+        block_indices = tuple(range(len(self.model.blocks) - count, len(self.model.blocks)))
+        if to_cuda:
+            if self._vae_offloaded_dit_blocks != block_indices:
+                raise RuntimeError("DiT blocks are not in the expected offloaded state")
+            action = "reload"
+        else:
+            if self._vae_offloaded_dit_blocks:
+                raise RuntimeError("DiT blocks are already offloaded")
+            action = "offload"
+
+        torch.cuda.synchronize(self.device)
+        started = time.monotonic()
+        before_allocated = torch.cuda.memory_allocated(self.device)
+        parameter_bytes = 0
+        parameter_count = 0
+        for block_index in block_indices:
+            block = self.model.blocks[block_index]
+            parameter_names = [name for name, _ in block.named_parameters()]
+            for local_name in parameter_names:
+                full_name = f"blocks.{block_index}.{local_name}"
+                master = self.dit_cpu_state_dict.get(full_name)
+                if master is None:
+                    raise RuntimeError(f"CPU master is missing {full_name}")
+                if master.device.type != "cpu":
+                    raise RuntimeError(f"CPU master tensor is not on CPU: {full_name}")
+                target = master.to(self.device) if to_cuda else master
+                replacement = self._replace_module_parameter(block, local_name, target)
+                if to_cuda:
+                    if replacement.device != self.device:
+                        raise RuntimeError(f"Failed to reload {full_name} on CUDA")
+                elif replacement.untyped_storage().data_ptr() != master.untyped_storage().data_ptr():
+                    raise RuntimeError(f"Offloaded parameter copied CPU master: {full_name}")
+                parameter_bytes += master.numel() * master.element_size()
+                parameter_count += 1
+
+        self._vae_offloaded_dit_blocks = block_indices if not to_cuda else ()
+        gc.collect()
+        torch.cuda.synchronize(self.device)
+        torch.cuda.empty_cache()
+        after_allocated = torch.cuda.memory_allocated(self.device)
+        free, total = torch.cuda.mem_get_info(self.device)
+        logging.info(
+            "SCAIL2_DIT_PHASE action=%s blocks=%s parameter_count=%d "
+            "parameter_mib=%.1f elapsed_seconds=%.3f allocated_before_mib=%.1f "
+            "allocated_after_mib=%.1f device_used_mib=%.1f",
+            action,
+            f"{block_indices[0]}-{block_indices[-1]}",
+            parameter_count,
+            parameter_bytes / 2**20,
+            time.monotonic() - started,
+            before_allocated / 2**20,
+            after_allocated / 2**20,
+            (total - free) / 2**20,
+        )
 
     def fuse_lora(self, lora_path, alpha=1.0):
         logging.info(f"Fusing LoRA from {lora_path}, strength = {alpha}.")
@@ -763,6 +904,8 @@ class SCAIL2Pipeline:
                  additional_ref_mask_imgs: list[torch.Tensor] = None,
                  conditioning: dict[str, torch.Tensor] = None,
                  diagnostic_memory_probe: bool = False,
+                 diagnostic_memory_probe_steps: int = 1,
+                 diagnostic_segment_limit: int = None,
                  **kwargs):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
@@ -808,6 +951,20 @@ class SCAIL2Pipeline:
             raise ValueError("segment_len must be positive")
         if sampling_steps <= 0:
             raise ValueError("sampling_steps must be positive")
+        if diagnostic_memory_probe and not (
+            1 <= diagnostic_memory_probe_steps <= sampling_steps
+        ):
+            raise ValueError(
+                "diagnostic_memory_probe_steps must be between 1 and "
+                f"sampling_steps ({sampling_steps}), got "
+                f"{diagnostic_memory_probe_steps}"
+            )
+        if diagnostic_segment_limit is not None and diagnostic_segment_limit <= 0:
+            raise ValueError("diagnostic_segment_limit must be positive")
+        if diagnostic_memory_probe and diagnostic_segment_limit is not None:
+            raise ValueError(
+                "diagnostic_memory_probe and diagnostic_segment_limit are mutually exclusive"
+            )
         if segment_overlap <= 0 or segment_overlap >= segment_len:
             raise ValueError("segment_overlap must be in (0, segment_len)")
         if (segment_overlap - 1) % self.vae_stride[0]:
@@ -870,11 +1027,25 @@ class SCAIL2Pipeline:
             segment_overlap=segment_overlap,
             temporal_stride=self.vae_stride[0],
         )
+        expected_output_frames = num_frames
         if diagnostic_memory_probe:
             segments = segments[:1]
             logging.info(
                 "SCAIL2_MEMORY_PROBE limiting execution to segment 1 and "
-                "diffusion step 1; VAE decode and output encoding are disabled."
+                "%d diffusion step(s); VAE decode and output encoding are "
+                "disabled.",
+                diagnostic_memory_probe_steps,
+            )
+        elif diagnostic_segment_limit is not None:
+            segments = segments[:diagnostic_segment_limit]
+            if not segments:
+                raise ValueError("diagnostic_segment_limit selected no segments")
+            expected_output_frames = segments[-1].valid_end
+            logging.info(
+                "SCAIL2_SEGMENT_PROBE limiting execution to %d segment(s); "
+                "output validation target is %d frames.",
+                len(segments),
+                expected_output_frames,
             )
         if len(segments) > 1:
             logging.info(
@@ -1152,7 +1323,7 @@ class SCAIL2Pipeline:
                 )
                 sample_scheduler, timesteps = build_sample_scheduler()
                 if diagnostic_memory_probe:
-                    timesteps = timesteps[:1]
+                    timesteps = timesteps[:diagnostic_memory_probe_steps]
 
                 pose_segment = pose_video[seg_start:seg_valid_end]
                 pad_frames = segment.padded_frames - segment.valid_frames
@@ -1320,9 +1491,13 @@ class SCAIL2Pipeline:
                     del probe_tensor, probe_bytes
                     del final_latent
                     logging.info(
-                        "SCAIL2_MEMORY_PROBE status=complete segment=1 step=1"
+                        "SCAIL2_MEMORY_PROBE status=complete segment=1 steps=%d",
+                        diagnostic_memory_probe_steps,
                     )
                     break
+
+                if self.vae_dit_offload_blocks:
+                    self._switch_vae_dit_blocks(to_cuda=False)
 
                 # The VAE is replicated rather than sharded. Decode only on
                 # rank 0 after clearing the diffusion inputs. Other ranks can
@@ -1445,6 +1620,9 @@ class SCAIL2Pipeline:
                     torch.cuda.synchronize()
                     torch.cuda.empty_cache()
 
+                if self.vae_dit_offload_blocks:
+                    self._switch_vae_dit_blocks(to_cuda=True)
+
         gc.collect()
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
@@ -1459,9 +1637,10 @@ class SCAIL2Pipeline:
             return None
         if self.rank == 0:
             video = torch.cat(output_segments, dim=1)
-            if video.shape[1] != num_frames:
+            if video.shape[1] != expected_output_frames:
                 raise RuntimeError(
-                    f"Generated {video.shape[1]} frames for {num_frames} input frames"
+                    f"Generated {video.shape[1]} frames for expected "
+                    f"{expected_output_frames} frames"
                 )
             return video
         return None

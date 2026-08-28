@@ -111,6 +111,9 @@ class EngineConfig:
     t5_meta_load: bool = False
     dit_fsdp: bool = True
     dit_meta_load: bool = False
+    dit_init_on_cpu: bool = True
+    keep_dit_cpu_state_dict: bool = False
+    vae_dit_offload_blocks: int = 0
     precomputed_conditioning: bool = False
     t5_cpu: bool = False
     offload_model: bool = False
@@ -141,6 +144,22 @@ class EngineConfig:
         if self.expected_world_size == 1 and (self.t5_fsdp or self.dit_fsdp):
             raise EnvironmentValidationError(
                 "FSDP requires a distributed world size greater than one"
+            )
+        if self.keep_dit_cpu_state_dict and self.dit_fsdp:
+            raise EnvironmentValidationError(
+                "Retaining a DiT CPU master is currently supported only "
+                "without FSDP"
+            )
+        if not 0 <= self.vae_dit_offload_blocks <= 40:
+            raise EnvironmentValidationError(
+                "vae_dit_offload_blocks must be between 0 and 40"
+            )
+        if self.vae_dit_offload_blocks and (
+            self.dit_fsdp or not self.keep_dit_cpu_state_dict
+        ):
+            raise EnvironmentValidationError(
+                "VAE-phase DiT block offload requires a non-FSDP DiT and "
+                "keep_dit_cpu_state_dict=True"
             )
         if check_paths:
             for label, path, require_directory in (

@@ -248,6 +248,9 @@ class Scail2InferenceEngine:
             lora_alpha=None,
             dit_resident_dtype=self.config.profile.resident_dtype,
             dit_meta_load=self.config.dit_meta_load,
+            init_on_cpu=self.config.dit_init_on_cpu,
+            keep_dit_cpu_state_dict=self.config.keep_dit_cpu_state_dict,
+            vae_dit_offload_blocks=self.config.vae_dit_offload_blocks,
             t5_meta_load=self.config.t5_meta_load,
             precomputed_conditioning=self.config.precomputed_conditioning,
         )
@@ -383,6 +386,8 @@ class Scail2InferenceEngine:
         temp_output: Path,
         seed: int,
         diagnostic_memory_probe: bool = False,
+        diagnostic_memory_probe_steps: int = 1,
+        diagnostic_segment_limit: int | None = None,
     ) -> None:
         """Call the legacy, byte-verified generation adapter."""
         from generate import generate_video
@@ -447,6 +452,8 @@ class Scail2InferenceEngine:
             ring_size=1,
             prompt=job.prompt,
             diagnostic_memory_probe=diagnostic_memory_probe,
+            diagnostic_memory_probe_steps=diagnostic_memory_probe_steps,
+            diagnostic_segment_limit=diagnostic_segment_limit,
         )
         generate_video(
             self.pipeline,
