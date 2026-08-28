@@ -481,3 +481,12 @@ wan/distributed/fsdp.py，以及 experiment_logs 下的两份日志。
 - K/V fast path 完整回归日志为 `101-20260828-150127.log`，输出 `101-20260828-150127.mp4`；297 帧、19587416 bytes，SHA-256 仍为 `7039c5f231eb64b544c4aa288ea5107411c9e7f51bdcf4c93d125d6e1610680a`。Ready-to-finished 为 424.583 秒，比 fast path 前少 1.713 秒；这是单次运行结果。
 - Cross-attention query 生命周期优化不做分块：调用方不再预先生成并保活 `self.norm3(x)`，而是把原始 hidden 和 query norm 传入 cross-attention；内部仍以完整长度执行相同的 LayerNorm、Q Linear 和 RMSNorm，并在 Q projection 返回后立即释放 953.8 MiB 的 FP32 归一化输入。诊断日志 `101-20260828-152305.log`：Cross Q/K/V 峰值从 23965.9 降至 23012.1 MiB，阶段结束 allocated 从 22073.2 降至 21119.5 MiB；block 0 最高峰转移到 K RoPE 的 23193.4 MiB，较修改前降低 772.5 MiB，两个 rank 最大 reserved 为 23740 MiB。首步 latent SHA-256 保持不变。
 - Cross query 提前释放的完整回归日志为 `101-20260828-152421.log`，输出 `101-20260828-152421.mp4`。任务正常完成四个 segment、297 帧，ready-to-finished 为 424.714 秒。新旧输出大小均为 19587416 bytes，SHA-256 均为 `7039c5f231eb64b544c4aa288ea5107411c9e7f51bdcf4c93d125d6e1610680a`，确认最终 MP4 逐字节一致。
+
+## 31. 完整推理设备级显存剖析（2026-08-28）
+
+- 新增 `--full-memory-profile`，与会截断推理的 `--memory-probe` 互斥。该模式完整执行 4 个 segment、24 个 diffusion step、VAE decode 和输出；记录两个 rank 的初始化/参考图 encode/segment prepare/每个 DiT block/scheduler/cleanup/VAE decode/history encode，并由父进程每 200 ms 采集物理 GPU NVML `memory.used`。
+- 完整日志为 `experiment_logs/fsdp_baseline/101-20260828-155713.log`，共 6759 行；输出为 `experiment_outputs/fsdp_baseline/101-20260828-155713.mp4`。任务 exit code 0，297 帧、19587416 bytes，SHA-256 仍为 `7039c5f231eb64b544c4aa288ea5107411c9e7f51bdcf4c93d125d6e1610680a`。
+- segment 1 / step 1 的 block 0 峰值仍为 23193.4 MiB；block 1--39 因 FP32 residual 多保留 476.9 MiB，峰值为 23670.3 MiB。完整 24 step 中最高 DiT allocated 为 23754.3 MiB，出现在 segment 2/3 的 step 6；长 segment 的最高 reserved 为 26342 MiB，同步 device used/NVML 为 27467 MiB。
+- 约 27G 的 DiT 设备占用可拆为约 23734.1 MiB live allocated、2607.9 MiB allocator cached/unallocated 和 1124.8 MiB CUDA context/NCCL/库/驱动占用。此前 block 0 报告与外部监控不一致的主要原因由此确认：统计范围和指标口径均不同。
+- 全任务最高点不是 DiT，而是仅由 rank 0/物理 GPU 2 执行的 segment 1 VAE decode：peak allocated=25617.3 MiB、reserved=28600 MiB、同步 device used=29724.8 MiB，200 ms NVML 峰值=29725 MiB。物理 GPU 3 不执行 decode，全任务 NVML 峰值保持为 DiT 阶段的 27467 MiB。
+- 详细分阶段数据、每个 segment/step 的 DiT 峰值和 VAE 分解见 `SCAIL2_FULL_MEMORY_PROFILE_REPORT.md`。若后续目标是降低 DiT live tensor，应继续处理后续 block FP32 residual 和多个约 23 GiB 的 attention 峰值；若目标是降低整条任务物理显存峰值，则 VAE decode 与常驻 DiT shard 的重叠优先级更高。

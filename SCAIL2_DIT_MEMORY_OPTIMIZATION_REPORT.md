@@ -26,6 +26,8 @@
 
 RoPE 内部 FP32/complex64 和 BF16 block residual 虽然还能降低部分占用，但会改变推理结果，因此未作为默认优化采用。
 
+补充说明：本报告的主表是 block 0 细粒度 tensor 分解，不代表整条推理的 NVML 峰值。完整 4-segment 剖析确认后续 block 因 FP32 residual 最高达到 23754.3 MiB allocated，DiT 设备 used 为 27467 MiB；rank 0 的 VAE decode 又达到全任务最高 29725 MiB。完整结果见 `SCAIL2_FULL_MEMORY_PROFILE_REPORT.md`。
+
 ## 2. 测量条件和口径
 
 固定条件：
@@ -424,4 +426,4 @@ python run_fsdp_experiment.py \
 - RoPE FP32/complex64 内部计算：已回退。
 - `--bf16-residual`：默认关闭，仅供实验。
 
-当前最高峰已变为 K RoPE 的 23193.4 MiB；Cross Q/K/V 为 23012.1 MiB，Self FlashAttention 为 23019.4 MiB。三个峰值已经非常接近，下一步若要继续明显降低 block 峰值，需要同时考虑 RoPE 分块粒度、Self Q/K/V 生命周期和 Cross Q RMSNorm 临时量，单独降低其中一项可能只会再次转移最高点。
+在 block 0 内，当前最高峰已变为 K RoPE 的 23193.4 MiB；Cross Q/K/V 为 23012.1 MiB，Self FlashAttention 为 23019.4 MiB。完整运行中 block 1--39 因 FP32 hidden 将对应峰值整体抬高约 476.9 MiB，完整 DiT allocated 最高为 23754.3 MiB。三个局部峰值已经非常接近，下一步若要继续明显降低 DiT 峰值，需要同时考虑 RoPE 分块粒度、Self Q/K/V 生命周期、Cross Q RMSNorm 临时量和后续 block residual；若目标是整条任务的物理显存峰值，还必须单独处理更高的 VAE decode 峰值。

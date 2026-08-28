@@ -59,6 +59,36 @@ def _memory_probe_end(module, stage, allocated_before, tensor=None):
     print(" ".join(fields), file=sys.stderr, flush=True)
 
 
+def _full_block_memory_begin(module):
+    if os.getenv("SCAIL2_FULL_MEMORY_PROFILE") != "1":
+        return None
+    device = torch.cuda.current_device()
+    torch.cuda.reset_peak_memory_stats(device)
+    return torch.cuda.memory_allocated(device)
+
+
+def _full_block_memory_end(module, allocated_before):
+    if allocated_before is None:
+        return
+    device = torch.cuda.current_device()
+    allocated = torch.cuda.memory_allocated(device)
+    reserved = torch.cuda.memory_reserved(device)
+    peak = torch.cuda.max_memory_allocated(device)
+    fields = [
+        "SCAIL2_DIT_BLOCK_MEMORY",
+        f"rank={os.getenv('RANK', '0')}",
+        f"block={getattr(module, '_scail2_block_index', -1)}",
+        f"segment={os.getenv('SCAIL2_PROFILE_SEGMENT', '-1')}",
+        f"step={os.getenv('SCAIL2_PROFILE_STEP', '-1')}",
+        f"pass={os.getenv('SCAIL2_PROFILE_PASS', 'unknown')}",
+        f"entry_allocated_mib={allocated_before / 2**20:.1f}",
+        f"end_allocated_mib={allocated / 2**20:.1f}",
+        f"peak_allocated_mib={peak / 2**20:.1f}",
+        f"reserved_mib={reserved / 2**20:.1f}",
+    ]
+    print(" ".join(fields), file=sys.stderr, flush=True)
+
+
 def sinusoidal_embedding_1d(dim, position):
     # preprocess
     assert dim % 2 == 0
@@ -540,6 +570,7 @@ class WanAttentionBlock(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
+        block_memory_before = _full_block_memory_begin(self)
         assert e.dtype == torch.float32
         with torch.amp.autocast("cuda", dtype=torch.float32):
             e = (self.modulation + e).chunk(6, dim=1)
@@ -623,6 +654,7 @@ class WanAttentionBlock(nn.Module):
             return x
 
         x = cross_attn_ffn(x, context, context_lens, e)
+        _full_block_memory_end(self, block_memory_before)
         return x
 
 

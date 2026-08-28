@@ -73,6 +73,45 @@ FP8_SCALE_SUFFIXES = (
 )
 
 
+def _full_memory_profile_enabled() -> bool:
+    return os.getenv("SCAIL2_FULL_MEMORY_PROFILE") == "1"
+
+
+def _log_memory_stage(
+    device,
+    rank,
+    stage,
+    event,
+    *,
+    reset_peak=False,
+    **metadata,
+):
+    """Log synchronized allocator and device memory for full profiling runs."""
+    if not _full_memory_profile_enabled():
+        return
+    torch.cuda.synchronize(device)
+    if reset_peak:
+        torch.cuda.reset_peak_memory_stats(device)
+    allocated = torch.cuda.memory_allocated(device)
+    reserved = torch.cuda.memory_reserved(device)
+    peak_allocated = torch.cuda.max_memory_allocated(device)
+    peak_reserved = torch.cuda.max_memory_reserved(device)
+    free, total = torch.cuda.mem_get_info(device)
+    fields = [
+        "SCAIL2_MEMORY_STAGE",
+        f"rank={rank}",
+        f"stage={stage}",
+        f"event={event}",
+        f"allocated_mib={allocated / 2**20:.1f}",
+        f"reserved_mib={reserved / 2**20:.1f}",
+        f"peak_allocated_mib={peak_allocated / 2**20:.1f}",
+        f"peak_reserved_mib={peak_reserved / 2**20:.1f}",
+        f"device_used_mib={(total - free) / 2**20:.1f}",
+    ]
+    fields.extend(f"{key}={value}" for key, value in metadata.items())
+    print(" ".join(fields), file=sys.stderr, flush=True)
+
+
 def _emit_pipeline_init_event(rank, stage, status, started_at=None, **details):
     fields = [
         "SCAIL2_INIT",
@@ -777,6 +816,10 @@ class SCAIL2Pipeline:
                 f"got {segment_overlap}"
             )
 
+        _log_memory_stage(
+            self.device, self.rank, "generation", "begin", reset_peak=True
+        )
+
         # Long inputs can occupy several GiB per condition tensor at 704p. Keep
         # the full sequences on CPU and move only the active segment to the GPU.
         pose_video = pose_video.cpu()
@@ -838,6 +881,9 @@ class SCAIL2Pipeline:
                 f"Sampling {len(segments)} segments with segment_len={segment_len}, "
                 f"segment_overlap={segment_overlap}.")
 
+        _log_memory_stage(
+            self.device, self.rank, "reference_encode", "begin", reset_peak=True
+        )
         ref_latent = self.vae.encode([rearrange(ori_img, 't c h w -> c t h w')])[0]
         
         additional_ref_latent = None
@@ -860,6 +906,9 @@ class SCAIL2Pipeline:
         ref_mask_latent_28ch = extract_and_compress_mask_to_latent(
             ref_mask_img.unsqueeze(1), additional_spatial_downsample=1
         )  # (28, 1, H_lat, W_lat)
+        _log_memory_stage(
+            self.device, self.rank, "reference_encode", "end"
+        )
         lat_c = ref_latent.shape[0]
 
         # TODO: support sequence_parallel
@@ -907,6 +956,10 @@ class SCAIL2Pipeline:
             clip_context = self.clip.visual([img[:, None, :, :]])
             if offload_model:
                 self.clip.model.cpu()
+
+        _log_memory_stage(
+            self.device, self.rank, "conditioning_ready", "snapshot"
+        )
 
         @contextmanager
         def noop_no_sync():
@@ -970,6 +1023,17 @@ class SCAIL2Pipeline:
                     self.model.to(self.device)
                 latent = apply_clean_history(latent, history_latent)
                 for step_index, t in enumerate(tqdm(timesteps)):
+                    profile_step = step_index + 1
+                    if _full_memory_profile_enabled():
+                        os.environ["SCAIL2_PROFILE_STEP"] = str(profile_step)
+                    _log_memory_stage(
+                        self.device,
+                        self.rank,
+                        "diffusion_step",
+                        "begin",
+                        segment=os.getenv("SCAIL2_PROFILE_SEGMENT", "-1"),
+                        step=profile_step,
+                    )
                     if os.getenv("SCAIL2_FSDP_DIAGNOSTICS") == "1":
                         allocated = torch.cuda.memory_allocated(self.device) / 2**20
                         reserved = torch.cuda.memory_reserved(self.device) / 2**20
@@ -992,17 +1056,37 @@ class SCAIL2Pipeline:
 
                     timestep = torch.stack(timestep).to(self.device)
 
+                    if _full_memory_profile_enabled():
+                        os.environ["SCAIL2_PROFILE_PASS"] = "conditional"
                     noise_pred_cond = self.model(
                         latent_model_input, t=timestep, **arg_c)[0].to(
                             torch.device('cpu') if offload_model else self.device)
+                    _log_memory_stage(
+                        self.device,
+                        self.rank,
+                        "diffusion_step",
+                        "conditional_complete",
+                        segment=os.getenv("SCAIL2_PROFILE_SEGMENT", "-1"),
+                        step=profile_step,
+                    )
                     if offload_model:
                         torch.cuda.empty_cache()
                     if guide_scale <= 1.0:
                         noise_pred = noise_pred_cond
                     else:
+                        if _full_memory_profile_enabled():
+                            os.environ["SCAIL2_PROFILE_PASS"] = "unconditional"
                         noise_pred_uncond = self.model(
                             latent_model_input, t=timestep, **arg_null)[0].to(
                                 torch.device('cpu') if offload_model else self.device)
+                        _log_memory_stage(
+                            self.device,
+                            self.rank,
+                            "diffusion_step",
+                            "unconditional_complete",
+                            segment=os.getenv("SCAIL2_PROFILE_SEGMENT", "-1"),
+                            step=profile_step,
+                        )
                         if offload_model:
                             torch.cuda.empty_cache()
                         noise_pred = noise_pred_uncond + guide_scale * (
@@ -1011,6 +1095,15 @@ class SCAIL2Pipeline:
                     latent = latent.to(
                         torch.device('cpu') if offload_model else self.device)
 
+                    _log_memory_stage(
+                        self.device,
+                        self.rank,
+                        "scheduler_step",
+                        "begin",
+                        reset_peak=True,
+                        segment=os.getenv("SCAIL2_PROFILE_SEGMENT", "-1"),
+                        step=profile_step,
+                    )
                     temp_x0 = sample_scheduler.step(
                         noise_pred.unsqueeze(0),
                         t,
@@ -1021,6 +1114,14 @@ class SCAIL2Pipeline:
 
                     x0 = [latent.to(self.device)]
                     del latent_model_input, timestep
+                    _log_memory_stage(
+                        self.device,
+                        self.rank,
+                        "scheduler_step",
+                        "end",
+                        segment=os.getenv("SCAIL2_PROFILE_SEGMENT", "-1"),
+                        step=profile_step,
+                    )
 
                 if offload_model:
                     self.model.cpu()
@@ -1034,10 +1135,21 @@ class SCAIL2Pipeline:
             for seg_idx, segment in enumerate(segments):
                 seg_start = segment.start
                 seg_valid_end = segment.valid_end
+                profile_segment = seg_idx + 1
+                if _full_memory_profile_enabled():
+                    os.environ["SCAIL2_PROFILE_SEGMENT"] = str(profile_segment)
                 logging.info(
                     f"Processing segment {seg_idx + 1}/{len(segments)}: "
                     f"frames [{seg_start}, {seg_valid_end}), "
                     f"padded_length={segment.padded_frames}")
+                _log_memory_stage(
+                    self.device,
+                    self.rank,
+                    "segment_prepare",
+                    "begin",
+                    reset_peak=True,
+                    segment=profile_segment,
+                )
                 sample_scheduler, timesteps = build_sample_scheduler()
                 if diagnostic_memory_probe:
                     timesteps = timesteps[:1]
@@ -1141,8 +1253,29 @@ class SCAIL2Pipeline:
                 if offload_model:
                     torch.cuda.empty_cache()
 
+                _log_memory_stage(
+                    self.device,
+                    self.rank,
+                    "segment_prepare",
+                    "end",
+                    segment=profile_segment,
+                )
+                _log_memory_stage(
+                    self.device,
+                    self.rank,
+                    "segment_diffusion",
+                    "begin",
+                    segment=profile_segment,
+                )
                 final_latent = sample_func(
                     noise, arg_c, arg_null, history_latent
+                )
+                _log_memory_stage(
+                    self.device,
+                    self.rank,
+                    "segment_diffusion",
+                    "end",
+                    segment=profile_segment,
                 )
 
                 del (
@@ -1164,6 +1297,13 @@ class SCAIL2Pipeline:
                 gc.collect()
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
+                _log_memory_stage(
+                    self.device,
+                    self.rank,
+                    "segment_cleanup",
+                    "snapshot",
+                    segment=profile_segment,
+                )
 
                 if diagnostic_memory_probe:
                     probe_tensor = final_latent.detach().to("cpu").contiguous()
@@ -1190,6 +1330,14 @@ class SCAIL2Pipeline:
                 # for the compact history-latent broadcast below.
                 next_history_pixel = None
                 if self.rank == 0:
+                    _log_memory_stage(
+                        self.device,
+                        self.rank,
+                        "vae_decode",
+                        "begin",
+                        reset_peak=True,
+                        segment=profile_segment,
+                    )
                     videos = self.vae.decode([final_latent])
                     segment_video = videos[0]
                     output_segments.append(
@@ -1209,6 +1357,13 @@ class SCAIL2Pipeline:
                             .contiguous()
                         )
                     del videos, segment_video
+                    _log_memory_stage(
+                        self.device,
+                        self.rank,
+                        "vae_decode",
+                        "end",
+                        segment=profile_segment,
+                    )
                 del final_latent
                 gc.collect()
                 torch.cuda.synchronize()
@@ -1221,9 +1376,24 @@ class SCAIL2Pipeline:
                         next_history_pixel_gpu = next_history_pixel.to(
                             self.device, dtype=self.param_dtype
                         )
+                        _log_memory_stage(
+                            self.device,
+                            self.rank,
+                            "history_encode",
+                            "begin",
+                            reset_peak=True,
+                            segment=profile_segment,
+                        )
                         next_history_latent = self.vae.encode(
                             [next_history_pixel_gpu]
                         )[0].contiguous()
+                        _log_memory_stage(
+                            self.device,
+                            self.rank,
+                            "history_encode",
+                            "end",
+                            segment=profile_segment,
+                        )
                         del next_history_pixel_gpu, next_history_pixel
                     if dist.is_initialized():
                         if self.rank == 0:
@@ -1280,6 +1450,10 @@ class SCAIL2Pipeline:
         torch.cuda.empty_cache()
         if dist.is_initialized():
             dist.barrier()
+
+        _log_memory_stage(
+            self.device, self.rank, "generation", "end"
+        )
 
         if diagnostic_memory_probe:
             return None

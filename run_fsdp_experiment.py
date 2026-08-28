@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -80,6 +81,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--full-memory-profile",
+        action="store_true",
+        help=(
+            "Run the complete inference while logging synchronized CUDA memory "
+            "stages, per-block DiT peaks, and device-level NVML samples."
+        ),
+    )
+    parser.add_argument(
         "--ffn-chunk-size",
         type=int,
         default=0,
@@ -141,21 +150,28 @@ class TimestampedLogWriter:
     def __init__(self, output_file: object) -> None:
         self.output_file = output_file
         self.pending = ""
+        self.lock = threading.Lock()
 
     def write(self, text: str) -> None:
-        normalized = (self.pending + text).replace("\r\n", "\n").replace(
-            "\r", "\n"
-        )
-        records = normalized.split("\n")
-        self.pending = records.pop()
-        for record in records:
+        with self.lock:
+            normalized = (self.pending + text).replace("\r\n", "\n").replace(
+                "\r", "\n"
+            )
+            records = normalized.split("\n")
+            self.pending = records.pop()
+            for record in records:
+                self._write_record(record)
+
+    def write_record(self, record: str) -> None:
+        with self.lock:
             self._write_record(record)
 
     def close(self) -> None:
-        if self.pending:
-            self._write_record(self.pending)
-            self.pending = ""
-        self.output_file.flush()
+        with self.lock:
+            if self.pending:
+                self._write_record(self.pending)
+                self.pending = ""
+            self.output_file.flush()
 
     def _write_record(self, record: str) -> None:
         if not record:
@@ -163,6 +179,98 @@ class TimestampedLogWriter:
         timestamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
         self.output_file.write(f"{timestamp} {record}\n".encode("utf-8"))
         self.output_file.flush()
+
+
+class NvmlMemorySampler:
+    """Continuously sample physical device memory through nvidia-smi/NVML."""
+
+    def __init__(
+        self,
+        physical_gpus: tuple[str, ...],
+        log_writer: TimestampedLogWriter,
+    ) -> None:
+        self.physical_gpus = physical_gpus
+        self.log_writer = log_writer
+        self.process: subprocess.Popen[str] | None = None
+        self.thread: threading.Thread | None = None
+        self.peaks: dict[str, tuple[int, int]] = {}
+
+    def start(self) -> None:
+        command = [
+            "nvidia-smi",
+            "-i",
+            ",".join(self.physical_gpus),
+            "--query-gpu=index,memory.used,memory.total,utilization.gpu",
+            "--format=csv,noheader,nounits",
+            "--loop-ms=200",
+        ]
+        self.process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        self.thread = threading.Thread(target=self._read_samples, daemon=True)
+        self.thread.start()
+
+    def _read_samples(self) -> None:
+        if self.process is None or self.process.stdout is None:
+            return
+        for raw_line in self.process.stdout:
+            line = raw_line.strip()
+            fields = [field.strip() for field in line.split(",")]
+            if len(fields) != 4 or not fields[0].isdigit():
+                self.log_writer.write_record(f"SCAIL2_NVML_MESSAGE {line}")
+                continue
+            physical_gpu, used, total, utilization = fields
+            try:
+                used_mib = int(used)
+                total_mib = int(total)
+            except ValueError:
+                self.log_writer.write_record(f"SCAIL2_NVML_MESSAGE {line}")
+                continue
+            previous = self.peaks.get(physical_gpu)
+            if previous is None or used_mib > previous[0]:
+                self.peaks[physical_gpu] = (used_mib, total_mib)
+            self.log_writer.write_record(
+                " ".join(
+                    [
+                        "SCAIL2_NVML_SAMPLE",
+                        f"physical_gpu={physical_gpu}",
+                        f"used_mib={used_mib}",
+                        f"total_mib={total_mib}",
+                        f"utilization_percent={utilization}",
+                    ]
+                )
+            )
+
+    def stop(self) -> list[str]:
+        if self.process is not None and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=5)
+        if self.thread is not None:
+            self.thread.join(timeout=5)
+        records = []
+        for physical_gpu in self.physical_gpus:
+            if physical_gpu not in self.peaks:
+                continue
+            used_mib, total_mib = self.peaks[physical_gpu]
+            records.append(
+                " ".join(
+                    [
+                        "SCAIL2_NVML_PEAK",
+                        f"physical_gpu={physical_gpu}",
+                        f"used_mib={used_mib}",
+                        f"total_mib={total_mib}",
+                    ]
+                )
+            )
+        return records
 
 
 def resolved_payload(args: argparse.Namespace) -> dict[str, object]:
@@ -183,6 +291,10 @@ def resolved_payload(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError("--ffn-chunk-size must be nonnegative")
     if args.rope_chunk_size < 0:
         raise ValueError("--rope-chunk-size must be nonnegative")
+    if args.memory_probe and args.full_memory_profile:
+        raise ValueError(
+            "--memory-probe and --full-memory-profile are mutually exclusive"
+        )
     return {
         "case": TEST_CASE,
         "job_id": job_id,
@@ -192,6 +304,7 @@ def resolved_payload(args: argparse.Namespace) -> dict[str, object]:
         "init_only": args.init_only,
         "diagnose_fsdp": args.diagnose_fsdp,
         "memory_probe": args.memory_probe,
+        "full_memory_profile": args.full_memory_profile,
         "ffn_chunk_size": args.ffn_chunk_size,
         "rope_chunk_size": args.rope_chunk_size,
         "bf16_residual": args.bf16_residual,
@@ -294,6 +407,8 @@ def launch_workers(payload: dict[str, object]) -> None:
         )
     if payload["memory_probe"]:
         env["SCAIL2_DIT_MEMORY_DIAGNOSTICS"] = "1"
+    if payload["full_memory_profile"]:
+        env["SCAIL2_FULL_MEMORY_PROFILE"] = "1"
     if payload["ffn_chunk_size"]:
         env["SCAIL2_FFN_CHUNK_SIZE"] = str(payload["ffn_chunk_size"])
     if payload["rope_chunk_size"]:
@@ -340,6 +455,11 @@ def launch_workers(payload: dict[str, object]) -> None:
         )
         + f"FSDP diagnostics: {'enabled' if payload['diagnose_fsdp'] else 'disabled'}\n"
         + f"DiT memory probe: {'enabled' if payload['memory_probe'] else 'disabled'}\n"
+        + (
+            "Full memory profile: enabled (CUDA stages + 200 ms NVML samples)\n"
+            if payload["full_memory_profile"]
+            else "Full memory profile: disabled\n"
+        )
         + f"FFN chunk size: {payload['ffn_chunk_size']}\n"
         + f"RoPE chunk size: {payload['rope_chunk_size']}\n"
         + f"BF16 residual: {'enabled' if payload['bf16_residual'] else 'disabled'}\n"
@@ -353,6 +473,10 @@ def launch_workers(payload: dict[str, object]) -> None:
     with log_path.open("wb") as log_file:
         timestamped_log = TimestampedLogWriter(log_file)
         timestamped_log.write(header)
+        nvml_sampler = None
+        if payload["full_memory_profile"]:
+            nvml_sampler = NvmlMemorySampler(physical_gpus, timestamped_log)
+            nvml_sampler.start()
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         process = subprocess.Popen(
             command,
@@ -374,6 +498,11 @@ def launch_workers(payload: dict[str, object]) -> None:
             timestamped_log.write(trailing_text)
             sys.stdout.write(trailing_text)
             sys.stdout.flush()
+        if nvml_sampler is not None:
+            for record in nvml_sampler.stop():
+                timestamped_log.write_record(record)
+                sys.stdout.write(record + "\n")
+                sys.stdout.flush()
         timestamped_log.close()
         return_code = process.wait()
 
@@ -445,6 +574,26 @@ def run_worker(args: argparse.Namespace, payload: dict[str, object]) -> None:
     try:
         engine.load()
         engine.warmup()
+        if payload["full_memory_profile"]:
+            import torch
+
+            torch.cuda.synchronize()
+            free, total = torch.cuda.mem_get_info()
+            print(
+                " ".join(
+                    [
+                        "SCAIL2_MEMORY_STAGE",
+                        f"rank={os.getenv('RANK', '0')}",
+                        "stage=engine_ready",
+                        "event=snapshot",
+                        f"allocated_mib={torch.cuda.memory_allocated() / 2**20:.1f}",
+                        f"reserved_mib={torch.cuda.memory_reserved() / 2**20:.1f}",
+                        f"device_used_mib={(total - free) / 2**20:.1f}",
+                    ]
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
         if args.init_only:
             if engine.is_primary:
                 print(
@@ -485,6 +634,24 @@ def run_worker(args: argparse.Namespace, payload: dict[str, object]) -> None:
                 )
             return
         result = engine.infer(job)
+        if payload["full_memory_profile"]:
+            torch.cuda.synchronize()
+            free, total = torch.cuda.mem_get_info()
+            print(
+                " ".join(
+                    [
+                        "SCAIL2_MEMORY_STAGE",
+                        f"rank={os.getenv('RANK', '0')}",
+                        "stage=inference_complete",
+                        "event=snapshot",
+                        f"allocated_mib={torch.cuda.memory_allocated() / 2**20:.1f}",
+                        f"reserved_mib={torch.cuda.memory_reserved() / 2**20:.1f}",
+                        f"device_used_mib={(total - free) / 2**20:.1f}",
+                    ]
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
         if engine.is_primary:
             print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2), flush=True)
     finally:
