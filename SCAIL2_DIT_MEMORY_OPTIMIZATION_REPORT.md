@@ -6,20 +6,22 @@
 
 当前 81 帧、512×896、双卡 FSDP 推理中，DiT 显存峰值主要来自长序列 self-attention，而不是 T5/CLIP conditioning。
 
-本轮最终验证四项无损优化：
+本轮最终验证六项无损优化：
 
 1. FFN 按 8192 token 分块。
 2. RoPE 保留 FP64/complex128 内部计算，但输出直接恢复为 BF16。
 3. cross-attention 输出合并和 block residual 使用原地累加。
 4. RoPE 保留 FP64/complex128 计算，并按 8192 token 分块执行。
+5. 完整长度的 FlashAttention K/V 使用 view，跳过冗余 `cat` 复制。
+6. Cross-attention 在 Q projection 后立即释放完整长度的归一化 query 输入。
 
 在 block 0 的细粒度测量中：
 
-- 最高 allocated peak 从 26350.1 MiB 降至 23973.1 MiB，减少 2377.0 MiB。
-- allocator 最大 reserved 从 27500 MiB 降至 24700 MiB，减少 2800 MiB。
+- 最高 allocated peak 从 26350.1 MiB 降至 23193.4 MiB，减少 3156.7 MiB。
+- 两个 rank 的 allocator 最大 reserved 从 27500 MiB 降至 23740 MiB，减少 3760 MiB。
 - FFN 计算局部峰值减少 1785.3 MiB。
 - cross-attention 后半段的 live allocation 最多减少约 953.8 MiB。
-- 完整推理耗时从 436.904 秒降至 426.297 秒，减少 10.607 秒（2.43%）；这是单次运行结果。
+- 最新完整推理耗时为 424.714 秒，相比 436.904 秒减少 12.190 秒（2.79%）；这是单次运行结果。
 - 完整输出 MP4 与优化前逐字节一致。
 
 RoPE 内部 FP32/complex64 和 BF16 block residual 虽然还能降低部分占用，但会改变推理结果，因此未作为默认优化采用。
@@ -144,7 +146,7 @@ FlashAttention 已经避免创建完整的 `48832×48832` attention matrix，因
 
 ## 5. 优化后 block 0 的显存分布
 
-最终优化诊断日志：`experiment_logs/fsdp_baseline/101-20260828-142607.log`
+最终优化诊断日志：`experiment_logs/fsdp_baseline/101-20260828-152305.log`
 
 基础占用仍使用第 4.1 节的 `B = 19196.9 MiB`。下表的结构和口径与未优化表一致，所有显存数值的单位均为 MiB。FFN 和 RoPE 均按 8192 token 分块；FFN 埋点覆盖整个分块循环，因此原来的五个 FFN 阶段在这里合并为“8192-token 分块计算”一行。
 
@@ -154,19 +156,19 @@ FlashAttention 已经避免创建完整的 `48832×48832` attention matrix，因
 | Self-attention | Q/K/V projection | Self 输入 FP32<br>953.8 | Q/K/V BF16<br>1430.6 | — | — | — | — | — | 2384.4 | autocast projection、RMSNorm 旧/新 tensor 重叠约 1430.8 | 21581.3 | 23012.1 |
 | Self-attention | Q RoPE | Self 输入 FP32<br>953.8 | Q/K/V BF16<br>1430.6 | Q RoPE BF16<br>476.9 | — | — | — | — | 2861.3 | 分块 FP64/complex128 临时量约 658.4 | 22058.2 | 22716.6 |
 | Self-attention | K RoPE | Self 输入 FP32<br>953.8 | Q/K/V BF16<br>1430.6 | Q RoPE BF16<br>476.9 | K RoPE BF16<br>476.9 | — | — | — | 3338.2 | 分块 FP64/complex128 临时量约 658.3 | 22535.1 | 23193.4 |
-| Self-attention | FlashAttention | Self 输入 FP32<br>953.8 | Q/K/V BF16<br>1430.6 | Q RoPE BF16<br>476.9 | K RoPE BF16<br>476.9 | Attention 输出 BF16<br>476.9 | — | — | 3815.0 | FlashAttention 输出和 workspace 约 961.2 | 23011.9 | **23973.1** |
+| Self-attention | FlashAttention | Self 输入 FP32<br>953.8 | Q/K/V BF16<br>1430.6 | Q RoPE BF16<br>476.9 | K RoPE BF16<br>476.9 | Attention 输出 BF16<br>476.9 | — | — | 3815.0 | FlashAttention workspace 约 7.5 | 23011.9 | 23019.4 |
 | Self-attention | Output projection | Self 输入 FP32<br>953.8 | Q/K/V BF16<br>1430.6 | Projected y BF16<br>476.9 | — | — | — | — | 2861.3 | autocast/GEMM 输出重叠约 477.9 | 22058.2 | 22536.1 |
 | Self-attention | Self residual | Projected y BF16<br>476.9 | 新 hidden FP32<br>953.8 | — | — | — | — | — | 1430.7 | `y*e` 和 residual 新旧结果重叠约 953.7 | 20627.6 | 21581.3 |
-| Cross-attention | Cross Q/K/V | Self y BF16<br>476.9 | 当前 hidden FP32<br>953.8 | Query 输入 FP32<br>953.8 | Cross Q BF16<br>476.9 | Context K/V BF16<br>约 15.0 | — | — | 2876.3 | Norm/RMSNorm、projection autocast 旧/新 tensor 约 1892.7 | 22073.2 | 23965.9 |
-| Cross-attention | CLIP image attention | Self y BF16<br>476.9 | 当前 hidden FP32<br>953.8 | Query 输入 FP32<br>953.8 | Cross Q BF16<br>476.9 | Context K/V BF16<br>约 15.0 | Image 输出 BF16<br>476.9 | — | 3353.2 | FlashAttention workspace 约 7.4 | 22550.1 | 22557.5 |
-| Cross-attention | T5 text attention | Self y BF16<br>476.9 | 当前 hidden FP32<br>953.8 | Query 输入 FP32<br>953.8 | Cross Q BF16<br>476.9 | Context K/V BF16<br>约 15.0 | Image 输出 BF16<br>476.9 | Text 输出 BF16<br>476.9 | 3830.1 | FlashAttention workspace 约 7.4 | 23027.0 | 23034.4 |
-| Cross-attention | Image/text 输出合并 | Self y BF16<br>476.9 | 当前 hidden FP32<br>953.8 | Query 输入 FP32<br>953.8 | Cross Q BF16<br>476.9 | Context K/V BF16<br>约 15.0 | Image 输出 BF16<br>476.9 | 合并输出 BF16<br>476.9 | 3830.1 | 原地合并，无新增 tensor<br>0.0 | 23027.0 | 23027.0 |
-| Cross-attention | Output projection | Self y BF16<br>476.9 | 当前 hidden FP32<br>953.8 | Query 输入 FP32<br>953.8 | Cross Q BF16<br>476.9 | Context K/V BF16<br>约 15.0 | Projected 输出 BF16<br>476.9 | — | 3353.2 | autocast/GEMM 输出重叠约 477.9 | 22550.1 | 23028.0 |
-| Cross-attention | Cross residual 整体 | Self y BF16<br>476.9 | 原地 hidden FP32<br>953.8 | — | — | — | — | — | 1430.7 | cross 子图与原地 residual 最大重叠约 2400.4 | 20627.6 | 23028.0 |
+| Cross-attention | Cross Q/K/V | Self y BF16<br>476.9 | 当前 hidden FP32<br>953.8 | Cross Q BF16<br>476.9 | Context K/V BF16<br>约 15.0 | — | — | — | 1922.6 | Query norm/RMSNorm、projection 临时量约 1892.6 | 21119.5 | 23012.1 |
+| Cross-attention | CLIP image attention | Self y BF16<br>476.9 | 当前 hidden FP32<br>953.8 | Cross Q BF16<br>476.9 | Context K/V BF16<br>约 15.0 | Image 输出 BF16<br>476.9 | — | — | 2399.5 | FlashAttention workspace 约 7.5 | 21596.3 | 21603.8 |
+| Cross-attention | T5 text attention | Self y BF16<br>476.9 | 当前 hidden FP32<br>953.8 | Cross Q BF16<br>476.9 | Context K/V BF16<br>约 15.0 | Image 输出 BF16<br>476.9 | Text 输出 BF16<br>476.9 | — | 2876.4 | FlashAttention workspace 约 7.5 | 22073.2 | 22080.7 |
+| Cross-attention | Image/text 输出合并 | Self y BF16<br>476.9 | 当前 hidden FP32<br>953.8 | Cross Q BF16<br>476.9 | Context K/V BF16<br>约 15.0 | Image 输出 BF16<br>476.9 | 合并输出 BF16<br>476.9 | — | 2876.4 | 原地合并，无新增 tensor<br>0.0 | 22073.2 | 22073.2 |
+| Cross-attention | Output projection | Self y BF16<br>476.9 | 当前 hidden FP32<br>953.8 | Cross Q BF16<br>476.9 | Context K/V BF16<br>约 15.0 | Projected 输出 BF16<br>476.9 | — | — | 2399.5 | autocast/GEMM 输出重叠约 477.9 | 21596.3 | 22074.2 |
+| Cross-attention | Cross residual 整体 | Self y BF16<br>476.9 | 原地 hidden FP32<br>953.8 | — | — | — | — | — | 1430.7 | cross 子图最大重叠约 1446.6 | 20627.6 | 22074.2 |
 | FFN | 8192-token 分块计算 | Self y BF16<br>476.9 | 当前 hidden FP32<br>953.8 | FFN 输出 BF16<br>476.9 | — | — | — | — | 1907.5 | 单 chunk 输入、hidden 和 GEMM 临时量约 457.0 | 21104.4 | 21561.4 |
 | FFN | FFN residual | Self y BF16<br>476.9 | 旧 hidden FP32<br>953.8 | FFN y BF16<br>476.9 | 新 hidden FP32<br>953.8 | — | — | — | 2861.3 | `y*e` 和 residual 新旧结果重叠约 953.7 | 22058.2 | 23011.9 |
 
-与未优化表直接对照可见：RoPE 的两份长期输出各从 953.8 降到 476.9，FP64/complex128 临时量又通过分块从约 2885 降到约 658；cross merge 和 cross residual 不再创建新的长序列 tensor；FFN 完整的 1287.6 中间结果被 8192-token chunk 的短生命周期临时量替代。
+与未优化表直接对照可见：RoPE 的两份长期输出各从 953.8 降到 476.9，FP64/complex128 临时量又通过分块从约 2885 降到约 658；完整长度 K/V 不再通过 `cat` 复制 953.8；cross query 的 953.8 MiB FP32 归一化输入在 Q projection 后立即释放；cross merge 和 cross residual 不再创建新的长序列 tensor；FFN 完整的 1287.6 中间结果被 8192-token chunk 的短生命周期临时量替代。
 
 ## 6. 各项优化的显存差异
 
@@ -215,7 +217,26 @@ FlashAttention 阶段降幅大于最终 block 峰值降幅，是因为修改后�
 
 首步 latent SHA-256 与基线完全一致。
 
-### 6.3 RoPE 8192-token 分块
+### 6.3 FlashAttention 完整长度 K/V fast path
+
+对照日志：
+
+- 修改前：`101-20260828-142607.log`
+- 修改后：`101-20260828-150011.log`
+
+当所有 `k_lens` 都等于物理 K/V 长度时，直接使用 `flatten(0, 1)` view；存在 padding 或变长序列时仍回退到原来的切片和 `cat`。当前 self-attention 的 `k_lens=[48832]`，因此可以避免两份 476.9 MiB 的完整 K/V 副本。
+
+| 指标 | 修改前 | Fast path | 变化 |
+|---|---:|---:|---:|
+| FlashAttention 峰值 | 23973.1 MiB | 23019.4 MiB | **-953.7 MiB** |
+| 阶段峰值增量 | 1438.1 MiB | 484.3 MiB | -953.8 MiB |
+| 峰值高于阶段结束 allocated | 961.2 MiB | 7.5 MiB | -953.7 MiB |
+| block 0 最高峰 | 23973.1 MiB | 23965.9 MiB | -7.2 MiB |
+| rank 0 最大 reserved | 24700 MiB | 24700 MiB | 0 |
+
+该优化没有改变原始 Q/K 的释放时机；它们仍存活到 self-attention forward 返回。首步 latent SHA-256 与基线一致，完整 MP4 也逐字节一致。全局最高点转移到 Cross Q/K/V。
+
+### 6.4 RoPE 8192-token 分块
 
 对照日志：
 
@@ -234,7 +255,7 @@ RoPE 继续使用 FP64 输入和 complex128 乘法，只把完整序列改为分
 
 最高点已经从 K RoPE 转移到 FlashAttention；Cross Q/K/V 的 23965.9 MiB 仅低 7.2 MiB。首步 latent SHA-256 和完整 MP4 SHA-256 均与未分块版本完全一致。
 
-### 6.4 Cross-attention 原地复用
+### 6.5 Cross-attention 原地复用
 
 对照日志：
 
@@ -259,6 +280,30 @@ RoPE 继续使用 FP64 输入和 complex128 乘法，只把完整序列改为分
 
 首步 latent SHA-256 与基线完全一致。
 
+### 6.6 Cross-attention query 输入提前释放
+
+对照日志：
+
+- 修改前：`101-20260828-150011.log`
+- 修改后：`101-20260828-152305.log`
+
+原实现先在调用方计算 `self.norm3(x)`，再把完整的 FP32 query 输入作为参数传入 cross-attention。Python 调用参数会让这份 `[1,48832,5120]`、953.8 MiB 的 tensor 一直存活到整个 cross-attention 返回。
+
+修改后把原始 hidden 和 `norm3` 传入 cross-attention；内部仍以完整长度依次执行相同的 LayerNorm、Q Linear 和 RMSNorm，但在 Q Linear 返回后立即删除归一化输入。该方案没有分块，也没有改变 GEMM 形状或运算顺序。
+
+| 指标 | 修改前 | 提前释放后 | 变化 |
+|---|---:|---:|---:|
+| Cross Q/K/V 阶段结束 allocated | 22073.2 MiB | 21119.5 MiB | **-953.7 MiB** |
+| Cross Q/K/V 峰值 | 23965.9 MiB | 23012.1 MiB | **-953.8 MiB** |
+| Cross image attention 峰值 | 22557.5 MiB | 21603.8 MiB | -953.7 MiB |
+| Cross text attention 峰值 | 23034.4 MiB | 22080.7 MiB | -953.7 MiB |
+| Cross output projection 峰值 | 23028.0 MiB | 22074.2 MiB | -953.8 MiB |
+| block 0 最高峰 | 23965.9 MiB | 23193.4 MiB | **-772.5 MiB** |
+| rank 0 最大 reserved | 24700 MiB | 23740 MiB | **-960 MiB** |
+| rank 1 最大 reserved | 25180 MiB | 23740 MiB | **-1440 MiB** |
+
+Cross Q/K/V 不再是最高点；block 0 的最高点转移到 K RoPE 的 23193.4 MiB。首步 latent SHA-256 和完整 MP4 SHA-256 均与修改前完全一致。
+
 ## 7. 无损组合前后的阶段对比
 
 最终无损组合为：
@@ -266,6 +311,8 @@ RoPE 继续使用 FP64 输入和 complex128 乘法，只把完整序列改为分
 - FFN chunk size 8192。
 - RoPE 输出为 BF16，内部 FP64/complex128 计算按 8192 token 分块。
 - cross-attention 原地复用。
+- 完整长度 FlashAttention K/V 使用 view fast path。
+- Cross-attention query 输入在 Q projection 后立即释放。
 - FP32 block residual 保持不变。
 
 | 阶段 | 原始峰值 | 无损组合峰值 | 变化 |
@@ -274,15 +321,15 @@ RoPE 继续使用 FP64 输入和 complex128 乘法，只把完整序列改为分
 | Self Q/K/V | 23012.1 MiB | 23012.1 MiB | 0 |
 | Q RoPE | 25328.1 MiB | 22716.6 MiB | -2611.5 MiB |
 | K RoPE | 26281.8 MiB | 23193.4 MiB | -3088.4 MiB |
-| FlashAttention | 26350.1 MiB | 23973.1 MiB | -2377.0 MiB |
+| FlashAttention | 26350.1 MiB | 23019.4 MiB | -3330.7 MiB |
 | Self output projection | 23489.8 MiB | 22536.1 MiB | -953.7 MiB |
-| Cross Q/K/V | 23965.9 MiB | 23965.9 MiB | 0 |
-| Cross merge | 23503.8 MiB | 23027.0 MiB | -476.8 MiB |
-| Cross residual | 23504.8 MiB | 23028.0 MiB | -476.8 MiB |
+| Cross Q/K/V | 23965.9 MiB | 23012.1 MiB | -953.8 MiB |
+| Cross merge | 23503.8 MiB | 22073.2 MiB | -1430.6 MiB |
+| Cross residual | 23504.8 MiB | 22074.2 MiB | -1430.6 MiB |
 | FFN 计算 | 24300.5 MiB | 21561.4 MiB | **-2739.1 MiB** |
 | FFN residual | 23965.7 MiB | 23011.9 MiB | -953.8 MiB |
-| block 0 最高峰 | 26350.1 MiB | 23973.1 MiB | **-2377.0 MiB** |
-| 最大 reserved | 27500 MiB | 24700 MiB | **-2800 MiB** |
+| block 0 最高峰 | 26350.1 MiB | 23193.4 MiB | **-3156.7 MiB** |
+| rank 0 最大 reserved | 27500 MiB | 23740 MiB | **-3760 MiB** |
 
 `FFN 计算` 的累计差值同时包含 FFN 分块和 cross residual 更早释放带来的收益，因此不能把表中各行差值直接相加。
 
@@ -346,16 +393,16 @@ python run_fsdp_experiment.py \
 
 日志和输出：
 
-- 日志：`experiment_logs/fsdp_baseline/101-20260828-142743.log`
-- 输出：`experiment_outputs/fsdp_baseline/101-20260828-142743.mp4`
+- 日志：`experiment_logs/fsdp_baseline/101-20260828-152421.log`
+- 输出：`experiment_outputs/fsdp_baseline/101-20260828-152421.mp4`
 
-| 指标 | Conditioning cache 基线 | RoPE 未分块优化 | 最终分块优化 |
-|---|---:|---:|---:|
-| Ready 到完成 | 436.904 秒 | 432.281 秒 | 426.297 秒 |
-| 相对基线 | — | -4.624 秒（-1.06%） | -10.607 秒（-2.43%） |
-| 输出帧数 | 297 | 297 | 297 |
-| 输出大小 | 19587416 bytes | 19587416 bytes | 19587416 bytes |
-| SHA-256 | `7039c5...0680a` | `7039c5...0680a` | `7039c5...0680a` |
+| 指标 | Conditioning cache 基线 | RoPE 分块优化 | K/V fast path | Cross query 释放 |
+|---|---:|---:|---:|---:|
+| Ready 到完成 | 436.904 秒 | 426.297 秒 | 424.583 秒 | 424.714 秒 |
+| 相对基线 | — | -10.607 秒（-2.43%） | -12.321 秒（-2.82%） | -12.190 秒（-2.79%） |
+| 输出帧数 | 297 | 297 | 297 | 297 |
+| 输出大小 | 19587416 bytes | 19587416 bytes | 19587416 bytes | 19587416 bytes |
+| SHA-256 | `7039c5...0680a` | `7039c5...0680a` | `7039c5...0680a` | `7039c5...0680a` |
 
 完整 SHA-256：
 
@@ -372,7 +419,9 @@ python run_fsdp_experiment.py \
 - `--rope-chunk-size 8192`：启用已验证的 FP64/complex128 RoPE 分块；默认 0，便于继续 A/B。
 - RoPE BF16 输出：已作为无损代码优化保留。
 - Cross-attention 原地复用：已作为无损代码优化保留。
+- 完整长度 FlashAttention K/V fast path：已保留；变长或含 padding 时自动回退到 `cat`。
+- Cross-attention query 输入提前释放：已保留；仍以完整长度执行 LayerNorm、Q Linear 和 RMSNorm。
 - RoPE FP32/complex64 内部计算：已回退。
 - `--bf16-residual`：默认关闭，仅供实验。
 
-当前最高峰已变为 FlashAttention 的 23973.1 MiB，Cross Q/K/V 为 23965.9 MiB，两者几乎相同。继续单独压缩 RoPE 已不会降低全局峰值；下一步需要同时处理 self-attention 的 Q/K/V 生命周期和 cross-attention query 输入占用。
+当前最高峰已变为 K RoPE 的 23193.4 MiB；Cross Q/K/V 为 23012.1 MiB，Self FlashAttention 为 23019.4 MiB。三个峰值已经非常接近，下一步若要继续明显降低 block 峰值，需要同时考虑 RoPE 分块粒度、Self Q/K/V 生命周期和 Cross Q RMSNorm 临时量，单独降低其中一项可能只会再次转移最高点。

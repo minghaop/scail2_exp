@@ -75,6 +75,11 @@ def flash_attention(
         k_lens = torch.tensor(
             [lk] * b, dtype=torch.int32).to(
                 device=k.device, non_blocking=True)
+    elif len(k_lens) == b and all(int(length) == lk for length in k_lens):
+        # No sequence contains padding. Preserve the varlen metadata, but use
+        # views instead of copying the complete K/V tensors through cat().
+        k = half(k.flatten(0, 1))
+        v = half(v.flatten(0, 1))
     else:
         k = half(torch.cat([u[:v] for u, v in zip(k, k_lens)]))
         v = half(torch.cat([u[:v] for u, v in zip(v, k_lens)]))

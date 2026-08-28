@@ -337,6 +337,13 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
+    def _project_cross_attention_query(self, x, query_norm=None):
+        """Project a cross query without retaining its normalized input."""
+        query_input = query_norm(x) if query_norm is not None else x
+        q = self.q(query_input)
+        del query_input
+        return self.norm_q(q)
+
     def forward(self, x, seq_lens, rope_apply_func, **kwargs):
         r"""
         Args:
@@ -386,7 +393,7 @@ class WanSelfAttention(nn.Module):
 
 class WanT2VCrossAttention(WanSelfAttention):
 
-    def forward(self, x, context, context_lens):
+    def forward(self, x, context, context_lens, query_norm=None):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
@@ -396,7 +403,9 @@ class WanT2VCrossAttention(WanSelfAttention):
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
         # compute query, key, value
-        q = self.norm_q(self.q(x)).view(b, -1, n, d)
+        q = self._project_cross_attention_query(x, query_norm).view(
+            b, -1, n, d
+        )
         k = self.norm_k(self.k(context)).view(b, -1, n, d)
         v = self.v(context).view(b, -1, n, d)
 
@@ -424,7 +433,7 @@ class WanI2VCrossAttention(WanSelfAttention):
         # self.alpha = nn.Parameter(torch.zeros((1, )))
         self.norm_k_img = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, context, context_lens):
+    def forward(self, x, context, context_lens, query_norm=None):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
@@ -438,7 +447,9 @@ class WanI2VCrossAttention(WanSelfAttention):
 
         # compute query, key, value
         memory_before = _memory_probe_begin(self)
-        q = self.norm_q(self.q(x)).view(b, -1, n, d)
+        q = self._project_cross_attention_query(x, query_norm).view(
+            b, -1, n, d
+        )
         k = self.norm_k(self.k(context)).view(b, -1, n, d)
         v = self.v(context).view(b, -1, n, d)
         k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
@@ -553,7 +564,7 @@ class WanAttentionBlock(nn.Module):
         def cross_attn_ffn(x, context, context_lens, e):
             memory_before = _memory_probe_begin(self)
             cross_output = self.cross_attn(
-                self.norm3(x), context, context_lens
+                x, context, context_lens, query_norm=self.norm3
             )
             x.add_(cross_output)
             del cross_output
