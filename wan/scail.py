@@ -290,6 +290,7 @@ class SCAIL2Pipeline:
         rank=0,
         t5_fsdp=False,
         dit_fsdp=False,
+        cast_dit_forward_inputs=False,
         use_usp=False,
         t5_cpu=False,
         init_on_cpu=True,
@@ -299,6 +300,7 @@ class SCAIL2Pipeline:
         dit_meta_load=False,
         keep_dit_cpu_state_dict=False,
         vae_dit_offload_blocks=0,
+        offload_vae_during_dit=False,
         t5_meta_load=False,
         precomputed_conditioning=False,
         online_clip_conditioning=False,
@@ -319,6 +321,10 @@ class SCAIL2Pipeline:
                 Enable FSDP sharding for T5 model
             dit_fsdp (`bool`, *optional*, defaults to False):
                 Enable FSDP sharding for DiT model
+            cast_dit_forward_inputs (`bool`, *optional*, defaults to False):
+                Cast every floating-point DiT forward input to the model
+                parameter dtype. The single-GPU experiment enables this to
+                reproduce root-FSDP mixed-precision input handling.
             use_usp (`bool`, *optional*, defaults to False):
                 Enable distribution strategy of USP.
             t5_cpu (`bool`, *optional*, defaults to False):
@@ -340,6 +346,9 @@ class SCAIL2Pipeline:
             vae_dit_offload_blocks (`int`, *optional*, defaults to 0):
                 Number of trailing DiT blocks to replace with CPU-master views
                 during VAE decode/history encode, then rematerialize on CUDA.
+            offload_vae_during_dit (`bool`, *optional*, defaults to False):
+                Keep the VAE on CPU outside reference, pose, decode, and
+                history-encode windows. Intended for single-GPU experiments.
             t5_meta_load (`bool`, *optional*, defaults to False):
                 Build T5 on the meta device and directly assign an mmap-backed
                 weights-only checkpoint before FSDP wrapping.
@@ -364,6 +373,7 @@ class SCAIL2Pipeline:
         elif self.rank != 0:
             raise ValueError("A non-distributed SCAIL2Pipeline must use rank 0")
         self.use_usp = use_usp
+        self.cast_dit_forward_inputs = bool(cast_dit_forward_inputs)
         self.t5_cpu = t5_cpu
         self.lora_path = lora_path
         self.lora_alpha = lora_alpha
@@ -376,6 +386,7 @@ class SCAIL2Pipeline:
         self.dit_meta_load = bool(dit_meta_load)
         self.keep_dit_cpu_state_dict = bool(keep_dit_cpu_state_dict)
         self.vae_dit_offload_blocks = int(vae_dit_offload_blocks)
+        self.offload_vae_during_dit = bool(offload_vae_during_dit)
         self.dit_cpu_state_dict = None
         self.dit_cpu_state_dict_bytes = 0
         self.t5_meta_load = bool(t5_meta_load)
@@ -807,6 +818,13 @@ class SCAIL2Pipeline:
                     "vae_dit_offload_blocks must be between 1 and "
                     f"{len(self.model.blocks)}"
                 )
+        if self.offload_vae_during_dit and (
+            dit_fsdp or (dist.is_initialized() and dist.get_world_size() != 1)
+        ):
+            raise ValueError(
+                "VAE CPU residency during DiT is supported only by the "
+                "non-FSDP single-GPU path"
+            )
         self._vae_offloaded_dit_blocks = ()
 
         self.sample_neg_prompt = config.sample_neg_prompt
@@ -926,6 +944,61 @@ class SCAIL2Pipeline:
             tuple(clip_context.shape),
         )
         return clip_context
+
+    def _switch_vae_device(self, *, to_cuda, reason):
+        if not self.offload_vae_during_dit:
+            return
+        target = self.device if to_cuda else torch.device("cpu")
+        parameters = list(self.vae.model.parameters())
+        current_devices = {parameter.device.type for parameter in parameters}
+        expected_type = target.type
+        scale_devices = {self.vae.mean.device.type, self.vae.std.device.type}
+        if current_devices == {expected_type} and scale_devices == {expected_type}:
+            return
+        if len(current_devices) != 1 or len(scale_devices) != 1:
+            raise RuntimeError(
+                "VAE has mixed parameter or scale tensor residency before "
+                f"device switch: parameters={sorted(current_devices)}, "
+                f"scale={sorted(scale_devices)}"
+            )
+
+        torch.cuda.synchronize(self.device)
+        started = time.monotonic()
+        before_allocated = torch.cuda.memory_allocated(self.device)
+        parameter_bytes = sum(
+            parameter.numel() * parameter.element_size()
+            for parameter in parameters
+        )
+        self.vae.model.to(target)
+        self.vae.mean = self.vae.mean.to(target)
+        self.vae.std = self.vae.std.to(target)
+        self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
+        self.vae.device = target
+
+        resulting_devices = {
+            parameter.device.type for parameter in self.vae.model.parameters()
+        }
+        if resulting_devices != {expected_type}:
+            raise RuntimeError(
+                f"Failed to move VAE to {target}: {sorted(resulting_devices)}"
+            )
+        gc.collect()
+        torch.cuda.synchronize(self.device)
+        torch.cuda.empty_cache()
+        after_allocated = torch.cuda.memory_allocated(self.device)
+        free, total = torch.cuda.mem_get_info(self.device)
+        logging.info(
+            "SCAIL2_VAE_PHASE action=%s reason=%s parameter_mib=%.1f "
+            "elapsed_seconds=%.3f allocated_before_mib=%.1f "
+            "allocated_after_mib=%.1f device_used_mib=%.1f",
+            "reload" if to_cuda else "offload",
+            reason,
+            parameter_bytes / 2**20,
+            time.monotonic() - started,
+            before_allocated / 2**20,
+            after_allocated / 2**20,
+            (total - free) / 2**20,
+        )
 
     def fuse_lora(self, lora_path, alpha=1.0):
         logging.info(f"Fusing LoRA from {lora_path}, strength = {alpha}.")
@@ -1139,6 +1212,10 @@ class SCAIL2Pipeline:
         _log_memory_stage(
             self.device, self.rank, "reference_encode", "end"
         )
+        self._switch_vae_device(
+            to_cuda=False,
+            reason="reference_encode_complete",
+        )
         lat_c = ref_latent.shape[0]
 
         # TODO: support sequence_parallel
@@ -1271,6 +1348,34 @@ class SCAIL2Pipeline:
                 return sample_scheduler, timesteps
 
             def sample_func(latent, arg_c, arg_null, history_latent):
+                def model_forward(model_input, model_timestep, model_kwargs):
+                    if self.cast_dit_forward_inputs:
+                        def cast_value(value):
+                            if isinstance(value, torch.Tensor):
+                                if (
+                                    torch.is_floating_point(value)
+                                    and value.dtype != self.param_dtype
+                                ):
+                                    return value.to(self.param_dtype)
+                                return value
+                            if isinstance(value, list):
+                                return [cast_value(item) for item in value]
+                            if isinstance(value, tuple):
+                                return tuple(cast_value(item) for item in value)
+                            if isinstance(value, dict):
+                                return {
+                                    key: cast_value(item)
+                                    for key, item in value.items()
+                                }
+                            return value
+
+                        model_input = cast_value(model_input)
+                        model_timestep = cast_value(model_timestep)
+                        model_kwargs = cast_value(model_kwargs)
+                    return self.model(
+                        model_input, t=model_timestep, **model_kwargs
+                    )
+
                 if offload_model:
                     self.model.to(self.device)
                 latent = apply_clean_history(latent, history_latent)
@@ -1310,9 +1415,19 @@ class SCAIL2Pipeline:
 
                     if _full_memory_profile_enabled():
                         os.environ["SCAIL2_PROFILE_PASS"] = "conditional"
-                    noise_pred_cond = self.model(
-                        latent_model_input, t=timestep, **arg_c)[0].to(
-                            torch.device('cpu') if offload_model else self.device)
+                    comparison_trace = (
+                        os.getenv("SCAIL2_COMPARE_TRACE") == "1"
+                        and step_index == 0
+                    )
+                    if comparison_trace:
+                        os.environ["SCAIL2_COMPARE_TRACE_ACTIVE"] = "1"
+                    try:
+                        noise_pred_cond = model_forward(
+                            latent_model_input, timestep, arg_c)[0].to(
+                                torch.device('cpu') if offload_model else self.device)
+                    finally:
+                        if comparison_trace:
+                            os.environ["SCAIL2_COMPARE_TRACE_ACTIVE"] = "0"
                     _log_memory_stage(
                         self.device,
                         self.rank,
@@ -1328,8 +1443,8 @@ class SCAIL2Pipeline:
                     else:
                         if _full_memory_profile_enabled():
                             os.environ["SCAIL2_PROFILE_PASS"] = "unconditional"
-                        noise_pred_uncond = self.model(
-                            latent_model_input, t=timestep, **arg_null)[0].to(
+                        noise_pred_uncond = model_forward(
+                            latent_model_input, timestep, arg_null)[0].to(
                                 torch.device('cpu') if offload_model else self.device)
                         _log_memory_stage(
                             self.device,
@@ -1418,7 +1533,15 @@ class SCAIL2Pipeline:
                 )
                 smpl_render_video = F.interpolate(
                     pose_segment, scale_factor=0.5, mode='bilinear', align_corners=False)
+                self._switch_vae_device(
+                    to_cuda=True,
+                    reason=f"segment_{profile_segment}_pose_encode",
+                )
                 pose_latent = self.vae.encode([rearrange(smpl_render_video, 't c h w -> c t h w')])[0]
+                self._switch_vae_device(
+                    to_cuda=False,
+                    reason=f"segment_{profile_segment}_diffusion",
+                )
 
                 lat_t = pose_latent.shape[1]
                 _, lat_h, lat_w = ref_latent.shape[1:]
@@ -1586,6 +1709,10 @@ class SCAIL2Pipeline:
                 # for the compact history-latent broadcast below.
                 next_history_pixel = None
                 if self.rank == 0:
+                    self._switch_vae_device(
+                        to_cuda=True,
+                        reason=f"segment_{profile_segment}_decode",
+                    )
                     _log_memory_stage(
                         self.device,
                         self.rank,
@@ -1701,6 +1828,10 @@ class SCAIL2Pipeline:
                     torch.cuda.synchronize()
                     torch.cuda.empty_cache()
 
+                self._switch_vae_device(
+                    to_cuda=False,
+                    reason=f"segment_{profile_segment}_vae_complete",
+                )
                 if self.vae_dit_offload_blocks:
                     self._switch_vae_dit_blocks(to_cuda=True)
 

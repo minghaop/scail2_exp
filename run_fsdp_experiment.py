@@ -81,6 +81,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--compare-trace",
+        action="store_true",
+        help="Hash first-step intermediate tensors for single/FSDP comparison.",
+    )
+    parser.add_argument(
         "--full-memory-profile",
         action="store_true",
         help=(
@@ -295,6 +300,8 @@ def resolved_payload(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError(
             "--memory-probe and --full-memory-profile are mutually exclusive"
         )
+    if args.compare_trace and not args.memory_probe:
+        raise ValueError("--compare-trace requires --memory-probe")
     return {
         "case": TEST_CASE,
         "job_id": job_id,
@@ -304,6 +311,7 @@ def resolved_payload(args: argparse.Namespace) -> dict[str, object]:
         "init_only": args.init_only,
         "diagnose_fsdp": args.diagnose_fsdp,
         "memory_probe": args.memory_probe,
+        "compare_trace": args.compare_trace,
         "full_memory_profile": args.full_memory_profile,
         "ffn_chunk_size": args.ffn_chunk_size,
         "rope_chunk_size": args.rope_chunk_size,
@@ -407,6 +415,8 @@ def launch_workers(payload: dict[str, object]) -> None:
         )
     if payload["memory_probe"]:
         env["SCAIL2_DIT_MEMORY_DIAGNOSTICS"] = "1"
+    if payload["compare_trace"]:
+        env["SCAIL2_COMPARE_TRACE"] = "1"
     if payload["full_memory_profile"]:
         env["SCAIL2_FULL_MEMORY_PROFILE"] = "1"
     if payload["ffn_chunk_size"]:
@@ -455,6 +465,7 @@ def launch_workers(payload: dict[str, object]) -> None:
         )
         + f"FSDP diagnostics: {'enabled' if payload['diagnose_fsdp'] else 'disabled'}\n"
         + f"DiT memory probe: {'enabled' if payload['memory_probe'] else 'disabled'}\n"
+        + f"Comparison trace: {'enabled' if payload['compare_trace'] else 'disabled'}\n"
         + (
             "Full memory profile: enabled (CUDA stages + 200 ms NVML samples)\n"
             if payload["full_memory_profile"]

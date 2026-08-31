@@ -1,4 +1,5 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import hashlib
 import math
 import os
 import sys
@@ -15,6 +16,52 @@ __all__ = ['SCAILModel']
 
 T5_CONTEXT_TOKEN_NUMBER = 512
 FIRST_LAST_FRAME_CONTEXT_TOKEN_NUMBER = 257 * 2
+
+
+def _comparison_trace(stage, tensor):
+    """Stream a tensor to CPU and log an exact hash in comparison probes."""
+    if os.getenv("SCAIL2_COMPARE_TRACE") != "1":
+        return
+    if os.getenv("SCAIL2_COMPARE_TRACE_ACTIVE") != "1":
+        return
+    if os.getenv("RANK", "0") != "0":
+        return
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"Comparison trace requires a tensor: {stage}")
+
+    source = tensor.detach()
+    was_contiguous = source.is_contiguous()
+    if not was_contiguous:
+        source = source.contiguous()
+    byte_view = source.view(torch.uint8).reshape(-1)
+    digest = hashlib.sha256()
+    chunk_bytes = 16 * 1024 * 1024
+    for start in range(0, byte_view.numel(), chunk_bytes):
+        chunk = byte_view[start:start + chunk_bytes].to("cpu")
+        digest.update(chunk.numpy().tobytes())
+        del chunk
+    shape = "x".join(str(value) for value in tensor.shape) or "scalar"
+    print(
+        " ".join(
+            [
+                "SCAIL2_COMPARE_TRACE",
+                "rank=0",
+                f"stage={stage}",
+                f"shape={shape}",
+                f"dtype={str(tensor.dtype).removeprefix('torch.')}",
+                f"contiguous={was_contiguous}",
+                f"sha256={digest.hexdigest()}",
+            ]
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
+    del byte_view, source
+
+
+def _comparison_trace_block(module, stage, tensor):
+    if getattr(module, "_scail2_block_index", None) == 0:
+        _comparison_trace(f"block0.{stage}", tensor)
 
 
 def _memory_probe_enabled(module) -> bool:
@@ -383,12 +430,22 @@ class WanSelfAttention(nn.Module):
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+        _comparison_trace_block(self, "self.input", x)
 
         # query, key, value function
         def qkv_fn(x):
-            q = self.norm_q(self.q(x)).view(b, s, n, d)
-            k = self.norm_k(self.k(x)).view(b, s, n, d)
+            q_linear = self.q(x)
+            _comparison_trace_block(self, "self.q_linear", q_linear)
+            q = self.norm_q(q_linear).view(b, s, n, d)
+            _comparison_trace_block(self, "self.q_norm", q)
+            del q_linear
+            k_linear = self.k(x)
+            _comparison_trace_block(self, "self.k_linear", k_linear)
+            k = self.norm_k(k_linear).view(b, s, n, d)
+            _comparison_trace_block(self, "self.k_norm", k)
+            del k_linear
             v = self.v(x).view(b, s, n, d)
+            _comparison_trace_block(self, "self.v", v)
             return q, k, v
 
         memory_before = _memory_probe_begin(self)
@@ -397,10 +454,12 @@ class WanSelfAttention(nn.Module):
 
         memory_before = _memory_probe_begin(self)
         q_rope = rope_apply_func(q)
+        _comparison_trace_block(self, "self.q_rope", q_rope)
         _memory_probe_end(self, "self_q_rope", memory_before, q_rope)
 
         memory_before = _memory_probe_begin(self)
         k_rope = rope_apply_func(k)
+        _comparison_trace_block(self, "self.k_rope", k_rope)
         _memory_probe_end(self, "self_k_rope", memory_before, k_rope)
 
         memory_before = _memory_probe_begin(self)
@@ -410,6 +469,7 @@ class WanSelfAttention(nn.Module):
             v=v,
             k_lens=seq_lens,
             window_size=self.window_size)
+        _comparison_trace_block(self, "self.flash_output", x)
         _memory_probe_end(self, "self_flash_attention", memory_before, x)
         del q_rope, k_rope
 
@@ -417,6 +477,7 @@ class WanSelfAttention(nn.Module):
         x = x.flatten(2)
         memory_before = _memory_probe_begin(self)
         x = self.o(x)
+        _comparison_trace_block(self, "self.output_projection", x)
         _memory_probe_end(self, "self_output_projection", memory_before, x)
         return x
 
@@ -431,6 +492,8 @@ class WanT2VCrossAttention(WanSelfAttention):
             context_lens(Tensor): Shape [B]
         """
         b, n, d = x.size(0), self.num_heads, self.head_dim
+        _comparison_trace_block(self, "cross.input", x)
+        _comparison_trace_block(self, "cross.context", context)
 
         # compute query, key, value
         q = self._project_cross_attention_query(x, query_norm).view(
@@ -480,18 +543,25 @@ class WanI2VCrossAttention(WanSelfAttention):
         q = self._project_cross_attention_query(x, query_norm).view(
             b, -1, n, d
         )
+        _comparison_trace_block(self, "cross.q", q)
         k = self.norm_k(self.k(context)).view(b, -1, n, d)
+        _comparison_trace_block(self, "cross.k_text", k)
         v = self.v(context).view(b, -1, n, d)
+        _comparison_trace_block(self, "cross.v_text", v)
         k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
+        _comparison_trace_block(self, "cross.k_image", k_img)
         v_img = self.v_img(context_img).view(b, -1, n, d)
+        _comparison_trace_block(self, "cross.v_image", v_img)
         _memory_probe_end(self, "cross_qkv", memory_before, q)
 
         memory_before = _memory_probe_begin(self)
         img_x = flash_attention(q, k_img, v_img, k_lens=None)
+        _comparison_trace_block(self, "cross.image_attention", img_x)
         _memory_probe_end(self, "cross_image_attention", memory_before, img_x)
         # compute attention
         memory_before = _memory_probe_begin(self)
         x = flash_attention(q, k, v, k_lens=context_lens)
+        _comparison_trace_block(self, "cross.text_attention", x)
         _memory_probe_end(self, "cross_text_attention", memory_before, x)
 
         # output
@@ -499,10 +569,12 @@ class WanI2VCrossAttention(WanSelfAttention):
         img_x = img_x.flatten(2)
         memory_before = _memory_probe_begin(self)
         x.add_(img_x)
+        _comparison_trace_block(self, "cross.merged", x)
         _memory_probe_end(self, "cross_attention_merge", memory_before, x)
         del img_x
         memory_before = _memory_probe_begin(self)
         x = self.o(x)
+        _comparison_trace_block(self, "cross.output_projection", x)
         _memory_probe_end(self, "cross_output_projection", memory_before, x)
         return x
 
@@ -571,14 +643,22 @@ class WanAttentionBlock(nn.Module):
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         block_memory_before = _full_block_memory_begin(self)
+        _comparison_trace_block(self, "input", x)
+        _comparison_trace_block(self, "time_input", e)
+        _comparison_trace_block(self, "context_input", context)
         assert e.dtype == torch.float32
         with torch.amp.autocast("cuda", dtype=torch.float32):
             e = (self.modulation + e).chunk(6, dim=1)
+        for modulation_index, modulation in enumerate(e):
+            _comparison_trace_block(
+                self, f"modulation_{modulation_index}", modulation
+            )
         assert e[0].dtype == torch.float32
 
         # self-attention
         memory_before = _memory_probe_begin(self)
         self_attn_input = self.norm1(x).float() * (1 + e[1]) + e[0]
+        _comparison_trace_block(self, "self_attention_input", self_attn_input)
         _memory_probe_end(
             self, "self_attention_input", memory_before, self_attn_input
         )
@@ -589,6 +669,7 @@ class WanAttentionBlock(nn.Module):
             x = x + y * e[2]
             if os.getenv("SCAIL2_BF16_RESIDUAL") == "1":
                 x = x.to(dtype=y.dtype)
+        _comparison_trace_block(self, "self_residual", x)
         _memory_probe_end(self, "self_residual", memory_before, x)
 
         # cross-attention & ffn function
@@ -597,7 +678,9 @@ class WanAttentionBlock(nn.Module):
             cross_output = self.cross_attn(
                 x, context, context_lens, query_norm=self.norm3
             )
+            _comparison_trace_block(self, "cross_output", cross_output)
             x.add_(cross_output)
+            _comparison_trace_block(self, "cross_residual", x)
             del cross_output
             _memory_probe_end(self, "cross_residual", memory_before, x)
 
@@ -618,6 +701,7 @@ class WanAttentionBlock(nn.Module):
                     del ffn_hidden
                     y[:, start:end].copy_(ffn_output)
                     del ffn_output, x_chunk
+                _comparison_trace_block(self, "ffn_output", y)
                 _memory_probe_end(
                     self,
                     f"ffn_chunked_{ffn_chunk_size}",
@@ -642,6 +726,7 @@ class WanAttentionBlock(nn.Module):
 
                 memory_before = _memory_probe_begin(self)
                 y = self.ffn[2](ffn_hidden)
+                _comparison_trace_block(self, "ffn_output", y)
                 _memory_probe_end(self, "ffn_linear_2", memory_before, y)
                 del ffn_hidden
 
@@ -650,6 +735,7 @@ class WanAttentionBlock(nn.Module):
                 x = x + y * e[5]
                 if os.getenv("SCAIL2_BF16_RESIDUAL") == "1":
                     x = x.to(dtype=y.dtype)
+            _comparison_trace_block(self, "output", x)
             _memory_probe_end(self, "ffn_residual", memory_before, x)
             return x
 
@@ -926,6 +1012,14 @@ class SCAIL2Model(ModelMixin, ConfigMixin):
         pose_latents = self.merge_list_of_tensors_to_batch(pose_latents)
         driving_masks = self.merge_list_of_tensors_to_batch(driving_masks)
         ref_masks = self.merge_list_of_tensors_to_batch(ref_masks)
+        _comparison_trace("model.input_x", x)
+        _comparison_trace("model.input_ref_latents", ref_latents)
+        _comparison_trace("model.input_pose_latents", pose_latents)
+        _comparison_trace("model.input_driving_masks", driving_masks)
+        _comparison_trace("model.input_ref_masks", ref_masks)
+        _comparison_trace("model.input_timestep", t)
+        _comparison_trace("model.input_text_context", context[0])
+        _comparison_trace("model.input_clip_context", clip_fea)
 
         if history_mask is None:
             x = self.apply_i2v_zeros_masks(x)
@@ -934,6 +1028,9 @@ class SCAIL2Model(ModelMixin, ConfigMixin):
             x = torch.cat([x, history_mask], dim=1)
         ref_latents = self.apply_i2v_ones_masks(ref_latents)
         pose_latents = self.apply_i2v_ones_masks(pose_latents)
+        _comparison_trace("model.masked_x", x)
+        _comparison_trace("model.masked_ref_latents", ref_latents)
+        _comparison_trace("model.masked_pose_latents", pose_latents)
 
         if additional_ref_latents is not None:
             if additional_ref_masks is None:
@@ -955,12 +1052,21 @@ class SCAIL2Model(ModelMixin, ConfigMixin):
 
         # embeddings
         x = torch.cat([ref_latents, x], dim=2)
+        _comparison_trace("model.patch_input", x)
+        _comparison_trace("model.patch_weight", self.patch_embedding.weight)
+        _comparison_trace("model.patch_bias", self.patch_embedding.bias)
         x = self.patch_embedding(x)
+        _comparison_trace("model.patch_output", x)
         ref_mask_emb = self.patch_embedding_mask(ref_masks)
+        _comparison_trace("model.ref_mask_embedding", ref_mask_emb)
         x = x + ref_mask_emb
+        _comparison_trace("model.video_embedding", x)
         pose_emb = self.patch_embedding_pose(pose_latents)
+        _comparison_trace("model.pose_embedding", pose_emb)
         sam_emb = self.patch_embedding_mask(driving_masks)
+        _comparison_trace("model.driving_mask_embedding", sam_emb)
         pose_emb = pose_emb + sam_emb
+        _comparison_trace("model.pose_condition_embedding", pose_emb)
         x = torch.cat(
             [
                 rearrange(x, "b c t h w -> b (t h w) c"),
@@ -968,6 +1074,7 @@ class SCAIL2Model(ModelMixin, ConfigMixin):
             ],
             dim=1,
         )
+        _comparison_trace("model.block_sequence", x)
 
         additional_ref_length = 0
         additional_ref_count = 0
@@ -987,9 +1094,12 @@ class SCAIL2Model(ModelMixin, ConfigMixin):
 
         # time embeddings
         with torch.amp.autocast("cuda", dtype=torch.float32):
-            e = self.time_embedding(
-                sinusoidal_embedding_1d(self.freq_dim, t).float())
+            timestep_embedding = sinusoidal_embedding_1d(self.freq_dim, t).float()
+            _comparison_trace("model.timestep_embedding", timestep_embedding)
+            e = self.time_embedding(timestep_embedding)
+            _comparison_trace("model.time_embedding", e)
             e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+            _comparison_trace("model.time_projection", e0)
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
         # context
@@ -1000,10 +1110,13 @@ class SCAIL2Model(ModelMixin, ConfigMixin):
                     [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
                 for u in context
             ]))
+        _comparison_trace("model.text_embedding", context)
 
         if clip_fea is not None:
             context_clip = self.img_emb(clip_fea)  # bs x 257 (x2) x dim
+            _comparison_trace("model.clip_embedding", context_clip)
             context = torch.concat([context_clip, context], dim=1)
+        _comparison_trace("model.combined_context", context)
 
         rope_t = T // self.patch_size[0]
         rope_h = H // self.patch_size[1]
@@ -1075,9 +1188,11 @@ class SCAIL2Model(ModelMixin, ConfigMixin):
 
         # head
         x = self.head(x, e)
+        _comparison_trace("model.head_output", x)
 
         # unpatchify
         x = self.unpatchify(x, grid_sizes, offset=additional_ref_length + ref_length)
+        _comparison_trace("model.output", x[0])
         return [u.float() for u in x]
 
     def unpatchify(self, x, grid_sizes, offset:int= 0):

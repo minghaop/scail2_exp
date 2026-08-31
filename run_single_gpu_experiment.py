@@ -78,6 +78,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--ffn-chunk-size", type=int, default=8192)
     parser.add_argument("--rope-chunk-size", type=int, default=8192)
+    parser.add_argument(
+        "--cached-clip",
+        action="store_true",
+        help="Use the cached CLIP context instead of running the CLIP model.",
+    )
+    parser.add_argument(
+        "--vae-cpu-during-dit",
+        action="store_true",
+        help="Keep VAE weights on CPU while the DiT diffusion loop runs.",
+    )
+    parser.add_argument(
+        "--compare-trace",
+        action="store_true",
+        help="Hash first-step intermediate tensors for single/FSDP comparison.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args()
@@ -97,6 +112,8 @@ def resolve_payload(args: argparse.Namespace) -> dict[str, object]:
         )
     if args.ffn_chunk_size < 0 or args.rope_chunk_size < 0:
         raise ValueError("Chunk sizes must be nonnegative")
+    if args.compare_trace and not args.memory_probe:
+        raise ValueError("--compare-trace requires --memory-probe")
     output = (args.output or default_output()).resolve()
     job_id = args.job_id or f"single-{TEST_CASE}-{output.stem}"
     return {
@@ -112,6 +129,9 @@ def resolve_payload(args: argparse.Namespace) -> dict[str, object]:
         "full_inference": args.full_inference,
         "ffn_chunk_size": args.ffn_chunk_size,
         "rope_chunk_size": args.rope_chunk_size,
+        "cached_clip": args.cached_clip,
+        "vae_cpu_during_dit": args.vae_cpu_during_dit,
+        "compare_trace": args.compare_trace,
         "profile": PROFILE_NAME,
         "checkpoint_dir": CHECKPOINT_DIR,
         "dit_checkpoint": DIT_CHECKPOINT,
@@ -138,6 +158,8 @@ def launch_worker(payload: dict[str, object]) -> None:
     }
     if payload["memory_probe"]:
         env["SCAIL2_DIT_MEMORY_DIAGNOSTICS"] = "1"
+    if payload["compare_trace"]:
+        env["SCAIL2_COMPARE_TRACE"] = "1"
     if payload["vae_offload_probe"]:
         env["SCAIL2_FULL_MEMORY_PROFILE"] = "1"
     if payload["ffn_chunk_size"]:
@@ -162,9 +184,14 @@ def launch_worker(payload: dict[str, object]) -> None:
         f"Log file: {log_path}\n"
         f"Launching single-GPU experiment on physical GPU {physical_gpu}\n"
         "World size: 1; process group: disabled; FSDP: disabled\n"
-        "T5: precomputed; CLIP: online CUDA encode then CPU offload; "
-        "DiT: full BF16 CUDA resident + CPU master\n"
-        "Mode: "
+        "T5: precomputed; CLIP: "
+        + (
+            "precomputed; "
+            if payload["cached_clip"]
+            else "online CUDA encode then CPU offload; "
+        )
+        + "DiT: full BF16 CUDA resident + CPU master; forward inputs cast to BF16\n"
+        + "Mode: "
         + (
             "init-only"
             if payload["init_only"]
@@ -179,6 +206,8 @@ def launch_worker(payload: dict[str, object]) -> None:
         + "\n"
         f"FFN chunk size: {payload['ffn_chunk_size']}\n"
         f"RoPE chunk size: {payload['rope_chunk_size']}\n"
+        f"Comparison trace: {'enabled' if payload['compare_trace'] else 'disabled'}\n"
+        f"VAE CPU during DiT: {'enabled' if payload['vae_cpu_during_dit'] else 'disabled'}\n"
         "Expandable segments: enabled\n"
         + " ".join(command)
         + "\n"
@@ -294,14 +323,16 @@ def run_worker(args: argparse.Namespace, payload: dict[str, object]) -> None:
         initialize_process_group=False,
         t5_fsdp=False,
         dit_fsdp=False,
+        cast_dit_forward_inputs=True,
         dit_meta_load=True,
         dit_init_on_cpu=False,
         keep_dit_cpu_state_dict=True,
         vae_dit_offload_blocks=(
             7 if args.vae_offload_probe or args.full_inference else 0
         ),
+        offload_vae_during_dit=args.vae_cpu_during_dit,
         precomputed_conditioning=True,
-        online_clip_conditioning=True,
+        online_clip_conditioning=not args.cached_clip,
         offload_model=False,
         output_audio_mode=str(payload["output_audio"]),
     )
@@ -404,7 +435,7 @@ def main() -> None:
         printable["world_size"] = 1
         printable["dit_fsdp"] = False
         printable["keep_dit_cpu_state_dict"] = True
-        printable["online_clip_conditioning"] = True
+        printable["online_clip_conditioning"] = not args.cached_clip
         print(json.dumps(printable, ensure_ascii=False, indent=2, sort_keys=True))
         return
     if args.worker:

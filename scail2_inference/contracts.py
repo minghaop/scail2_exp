@@ -110,10 +110,12 @@ class EngineConfig:
     t5_fsdp: bool = True
     t5_meta_load: bool = False
     dit_fsdp: bool = True
+    cast_dit_forward_inputs: bool = False
     dit_meta_load: bool = False
     dit_init_on_cpu: bool = True
     keep_dit_cpu_state_dict: bool = False
     vae_dit_offload_blocks: int = 0
+    offload_vae_during_dit: bool = False
     precomputed_conditioning: bool = False
     online_clip_conditioning: bool = False
     t5_cpu: bool = False
@@ -165,6 +167,11 @@ class EngineConfig:
             raise EnvironmentValidationError(
                 "VAE-phase DiT block offload requires a non-FSDP DiT and "
                 "keep_dit_cpu_state_dict=True"
+            )
+        if self.offload_vae_during_dit and self.expected_world_size != 1:
+            raise EnvironmentValidationError(
+                "VAE CPU residency during DiT is currently supported only "
+                "for explicit single-GPU configurations"
             )
         if check_paths:
             for label, path, require_directory in (
