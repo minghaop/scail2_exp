@@ -84,6 +84,11 @@ def parse_args() -> argparse.Namespace:
         help="Use the cached CLIP context instead of running the CLIP model.",
     )
     parser.add_argument(
+        "--cast-dit-forward-inputs",
+        action="store_true",
+        help="Cast floating DiT root inputs to BF16 to reproduce legacy FSDP semantics.",
+    )
+    parser.add_argument(
         "--vae-cpu-during-dit",
         action="store_true",
         help="Keep VAE weights on CPU while the DiT diffusion loop runs.",
@@ -130,6 +135,7 @@ def resolve_payload(args: argparse.Namespace) -> dict[str, object]:
         "ffn_chunk_size": args.ffn_chunk_size,
         "rope_chunk_size": args.rope_chunk_size,
         "cached_clip": args.cached_clip,
+        "cast_dit_forward_inputs": args.cast_dit_forward_inputs,
         "vae_cpu_during_dit": args.vae_cpu_during_dit,
         "compare_trace": args.compare_trace,
         "profile": PROFILE_NAME,
@@ -190,7 +196,12 @@ def launch_worker(payload: dict[str, object]) -> None:
             if payload["cached_clip"]
             else "online CUDA encode then CPU offload; "
         )
-        + "DiT: full BF16 CUDA resident + CPU master; forward inputs cast to BF16\n"
+        + "DiT: full BF16 CUDA resident + CPU master; forward inputs: "
+        + (
+            "cast to BF16 (legacy FSDP semantics)\n"
+            if payload["cast_dit_forward_inputs"]
+            else "preserve source dtype\n"
+        )
         + "Mode: "
         + (
             "init-only"
@@ -323,7 +334,7 @@ def run_worker(args: argparse.Namespace, payload: dict[str, object]) -> None:
         initialize_process_group=False,
         t5_fsdp=False,
         dit_fsdp=False,
-        cast_dit_forward_inputs=True,
+        cast_dit_forward_inputs=args.cast_dit_forward_inputs,
         dit_meta_load=True,
         dit_init_on_cpu=False,
         keep_dit_cpu_state_dict=True,

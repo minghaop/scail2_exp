@@ -565,3 +565,11 @@ wan/distributed/fsdp.py，以及 experiment_logs 下的两份日志。
 - 完整日志为 `experiment_logs/single_gpu/101-20260831-132759.log`，输出为 `experiment_outputs/single_gpu/101-20260831-132759.mp4`。4 个 segment、24 个 diffusion step、在线 CLIP、VAE CPU residency、7-block VAE 阶段 offload/reload 和音频 mux 全部成功，exit code 0。
 - 完整 NVML 峰值为 39249/40960 MiB，比仅 VAE CPU 对照的 39949 MiB 再降 700 MiB，比未移动 VAE 的 40441 MiB 降 1192 MiB；物理余量达到 1711 MiB（4.18%）。请求用时 436.526 秒，未观察到可归因于提前释放的性能损失。
 - 最终 MP4 为 19587416 bytes，SHA-256=`7039c5f231eb64b544c4aa288ea5107411c9e7f51bdcf4c93d125d6e1610680a`，与双卡基准逐字节一致。下一批局部高点已接近：Self/Cross QKV 与 FFN residual 均约 36278 MiB，继续降低峰值需要同时处理这些阶段，而不是只优化 RoPE。
+
+## 38. 新 FP16 context 标准与 CLIP cache 完整性能回归（2026-08-31）
+
+- 根据 dtype 路径和 FP32 参考分析，最终决定不采用入口 FP16->BF16 转换作为标准。单卡入口新增显式 `--cast-dit-forward-inputs` 诊断开关，默认保留输入 dtype；该开关仅用于复现旧 FSDP 语义。本轮使用 `--cached-clip --vae-cpu-during-dit`，CLIP 模型不加载、不执行在线编码。
+- 完整日志为 `experiment_logs/single_gpu/101-20260831-140335.log`，输出为 `experiment_outputs/single_gpu/101-20260831-140335.mp4`。4 个 segment、24 个 diffusion step、4 次 VAE decode、3 次 history encode、7-block offload/reload 和 driving audio 均成功，exit code 0。
+- Engine load 为 12.329 秒，比在线 CLIP/BF16 入口回归的 17.835 秒少 5.506 秒。请求 started-to-finished 为 434.250 秒，比上一轮 436.526 秒少 2.276 秒；三个 81 帧 segment 平均 16.73/16.71/16.70 秒/步，57 帧 segment 为 10.32 秒/步，核心 DiT 性能无实质变化。
+- VAE 的 17 次 CPU/GPU 迁移累计 4.632 秒；4 次 DiT block offload/reload 合计 6.362 秒；audio mux 为 2.444 秒。NVML 峰值为 38941/40960 MiB，物理余量 2019 MiB（4.93%），比上一轮 39249 MiB 再低 308 MiB。最终 RSS 为 34096.6 MiB，比在线 CLIP版本低 2613.5 MiB。
+- 新输出为 19652849 bytes，SHA-256=`fcb0871b57305440b8cd33ab8e3960a7d8f81f68c401190addda80ac59137d7e`；与历史不转换但在线执行 CLIP 的 `101-20260828-191836.mp4` 完全相同，H.264 和 AAC stream 也分别逐字节一致。由此确认 cached CLIP 与在线 CLIP 在新标准下结果一致。
