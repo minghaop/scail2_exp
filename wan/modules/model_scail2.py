@@ -455,11 +455,13 @@ class WanSelfAttention(nn.Module):
         memory_before = _memory_probe_begin(self)
         q_rope = rope_apply_func(q)
         _comparison_trace_block(self, "self.q_rope", q_rope)
+        del q
         _memory_probe_end(self, "self_q_rope", memory_before, q_rope)
 
         memory_before = _memory_probe_begin(self)
         k_rope = rope_apply_func(k)
         _comparison_trace_block(self, "self.k_rope", k_rope)
+        del k
         _memory_probe_end(self, "self_k_rope", memory_before, k_rope)
 
         memory_before = _memory_probe_begin(self)
@@ -470,8 +472,8 @@ class WanSelfAttention(nn.Module):
             k_lens=seq_lens,
             window_size=self.window_size)
         _comparison_trace_block(self, "self.flash_output", x)
+        del q_rope, k_rope, v
         _memory_probe_end(self, "self_flash_attention", memory_before, x)
-        del q_rope, k_rope
 
         # output
         x = x.flatten(2)

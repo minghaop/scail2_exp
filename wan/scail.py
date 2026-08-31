@@ -1533,11 +1533,13 @@ class SCAIL2Pipeline:
                 )
                 smpl_render_video = F.interpolate(
                     pose_segment, scale_factor=0.5, mode='bilinear', align_corners=False)
+                del pose_segment
                 self._switch_vae_device(
                     to_cuda=True,
                     reason=f"segment_{profile_segment}_pose_encode",
                 )
                 pose_latent = self.vae.encode([rearrange(smpl_render_video, 't c h w -> c t h w')])[0]
+                del smpl_render_video
                 self._switch_vae_device(
                     to_cuda=False,
                     reason=f"segment_{profile_segment}_diffusion",
@@ -1550,6 +1552,7 @@ class SCAIL2Pipeline:
                     ref_mask_latent_28ch.shape[0], lat_t, lat_h, lat_w,
                     device=self.device, dtype=ref_mask_latent_28ch.dtype)
                 ref_masks = torch.cat([ref_mask_latent_28ch, null_noisy_mask], dim=1)
+                del null_noisy_mask
 
                 driving_mask_segment = driving_mask_video[:, seg_start:seg_valid_end]
                 if pad_frames:
@@ -1568,6 +1571,7 @@ class SCAIL2Pipeline:
                 driving_masks = extract_and_compress_mask_to_latent(
                     driving_mask_segment, additional_spatial_downsample=1
                 )
+                del driving_mask_segment
 
                 history_latent = prev_history_latent
                 prev_history_latent = None
@@ -1625,7 +1629,11 @@ class SCAIL2Pipeline:
                     'additional_ref_masks': None if additional_ref_mask_latent_28ch is None else [additional_ref_mask_latent_28ch],
                 }
 
-                if offload_model:
+                # The full-resolution pose/mask preparation tensors have
+                # already produced their compact DiT inputs. In an offload
+                # path, return their cached blocks before the long diffusion
+                # loop. Do not add a cache flush to the normal FSDP path.
+                if offload_model or self.offload_vae_during_dit:
                     torch.cuda.empty_cache()
 
                 _log_memory_stage(
@@ -1655,12 +1663,8 @@ class SCAIL2Pipeline:
 
                 del (
                     noise,
-                    pose_segment,
-                    smpl_render_video,
                     pose_latent,
-                    null_noisy_mask,
                     ref_masks,
-                    driving_mask_segment,
                     driving_masks,
                     arg_c,
                     arg_null,

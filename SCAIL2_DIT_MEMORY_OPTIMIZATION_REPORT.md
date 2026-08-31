@@ -236,7 +236,7 @@ FlashAttention 阶段降幅大于最终 block 峰值降幅，是因为修改后�
 | block 0 最高峰 | 23973.1 MiB | 23965.9 MiB | -7.2 MiB |
 | rank 0 最大 reserved | 24700 MiB | 24700 MiB | 0 |
 
-该优化没有改变原始 Q/K 的释放时机；它们仍存活到 self-attention forward 返回。首步 latent SHA-256 与基线一致，完整 MP4 也逐字节一致。全局最高点转移到 Cross Q/K/V。
+该优化在当时没有改变原始 Q/K 的释放时机；它们仍存活到 self-attention forward 返回。后续单卡生命周期优化见第 11 节。首步 latent SHA-256 与基线一致，完整 MP4 也逐字节一致。全局最高点转移到 Cross Q/K/V。
 
 ### 6.4 RoPE 8192-token 分块
 
@@ -427,3 +427,27 @@ python run_fsdp_experiment.py \
 - `--bf16-residual`：默认关闭，仅供实验。
 
 在 block 0 内，当前最高峰已变为 K RoPE 的 23193.4 MiB；Cross Q/K/V 为 23012.1 MiB，Self FlashAttention 为 23019.4 MiB。完整运行中 block 1--39 因 FP32 hidden 将对应峰值整体抬高约 476.9 MiB，完整 DiT allocated 最高为 23754.3 MiB。三个局部峰值已经非常接近，下一步若要继续明显降低 DiT 峰值，需要同时考虑 RoPE 分块粒度、Self Q/K/V 生命周期、Cross Q RMSNorm 临时量和后续 block residual；若目标是整条任务的物理显存峰值，还必须单独处理更高的 VAE decode 峰值。
+
+## 11. 单卡预处理与 Self Q/K/V 生命周期优化（2026-08-31）
+
+本节是后续单卡实验，绝对显存值不能与前面双卡 FSDP 的每卡 shard 数值直接比较。实验继续启用 VAE 在 DiT 阶段驻留 CPU，并保持完整 DiT 权重常驻单张 GPU。
+
+segment 预处理产生紧凑 DiT 输入后，立即释放不再使用的全分辨率/中间 tensor：`pose_segment` 425.2 MiB、`smpl_render_video` 106.3 MiB、`driving_mask_segment` 106.3 MiB 和 `null_noisy_mask` 16.1 MiB，合计约 653.9 MiB。仅在单卡 VAE-offload 或原有模型 offload 路径进入 diffusion 前清理 allocator cache，普通双卡 FSDP 路径不新增 cache flush。
+
+Self-attention 中原始 Q、K、V 均约 476.9 MiB。Q 完成 RoPE 后立即释放原始 Q，K 完成 RoPE 后立即释放原始 K；FlashAttention 返回后立即释放旋转后的 Q/K 和原始 V。运算顺序、dtype 和算子均未改变。
+
+首步 probe 日志为 `experiment_logs/single_gpu/101-20260831-132638.log`：
+
+| 阶段 | 仅 VAE CPU | 增加生命周期优化 | 变化 |
+|---|---:|---:|---:|
+| Self 输入 phase peak | 35024.9 MiB | 34370.9 MiB | -654.0 MiB |
+| Self Q/K/V phase peak | 36932.2 MiB | 36278.3 MiB | -653.9 MiB |
+| K RoPE phase peak | 37113.5 MiB | 35982.7 MiB | -1130.8 MiB |
+| FlashAttention phase peak | 36939.5 MiB | 35331.8 MiB | -1607.7 MiB |
+| Self output projection phase peak | 36456.2 MiB | 34371.6 MiB | -2084.6 MiB |
+| block 0 最高 phase peak | 37113.5 MiB | 36278.3 MiB | -835.2 MiB |
+| 整个 probe NVML 峰值 | 39527 MiB | 38867 MiB | -660 MiB |
+
+局部下降与 tensor 大小吻合：预处理 tensor 贡献约 654 MiB，K RoPE 额外少保留一份 476.9 MiB 原始 Q，FlashAttention 再少保留一份 476.9 MiB 原始 K，输出 projection 再少保留一份 476.9 MiB V。优化后最高阶段转移到 Self/Cross QKV 和 FFN residual 附近，因此全 block 降幅小于某些局部阶段降幅。首步 latent SHA-256 仍为 `f6845ee32b24e01bb80b8f6dfa3467c62119bb3014ef94f65718a40bd8085261`。
+
+完整回归日志为 `experiment_logs/single_gpu/101-20260831-132759.log`，输出为 `experiment_outputs/single_gpu/101-20260831-132759.mp4`。任务用时 436.526 秒；NVML 峰值为 39249/40960 MiB，比仅 VAE CPU 的完整对照 39949 MiB 再降 700 MiB，比最初对齐数值但 VAE 留在 GPU 的 40441 MiB 降 1192 MiB。物理余量增至 1711 MiB（4.18%）。最终 MP4 为 19587416 bytes，SHA-256=`7039c5f231eb64b544c4aa288ea5107411c9e7f51bdcf4c93d125d6e1610680a`，与双卡基准逐字节一致。

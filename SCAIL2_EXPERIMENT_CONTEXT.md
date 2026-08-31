@@ -556,3 +556,12 @@ wan/distributed/fsdp.py，以及 experiment_logs 下的两份日志。
 - 完整任务 NVML 峰值从未移动 VAE 的 40441 降到 39949 MiB，减少 492 MiB；40 GiB GPU 的物理余量从 519 增加到 1011 MiB。前三个长 segment 的 DiT 峰值均为 39949 MiB，最后一个短 segment 为 37711 MiB；VAE/history 区间最高为 38439 MiB。最终峰值仍由 DiT 决定。
 - VAE 共发生 17 次迁移（包含 reference 后首次 offload），累计 4.647 秒，其中 reload 2.190 秒、offload 2.457 秒。请求 started-to-finished 为 439.766 秒，未移动 VAE 的对照为 437.209 秒，本次单次运行增加 2.557 秒；音频 mux 和一次 5.027 秒 DiT block 冷态 reload 存在波动，因此不能把差值完全归因于 VAE 迁移。最终 RSS 为 36600.2 MiB，比对照高约 2067.6 MiB，表明反复 CPU/GPU 迁移会提高 host allocator 高水位，但服务器主内存当前足够。
 - 新输出与未移动 VAE 的单卡输出及原双卡基准均为 19587416 bytes，MP4 SHA-256 均为 `7039c5f231eb64b544c4aa288ea5107411c9e7f51bdcf4c93d125d6e1610680a`。迁移不改变最终结果。虽然物理余量约翻倍，但 1011 MiB 仍仅占总显存约 2.47%，尚不足以视为稳健生产余量；后续仍需继续降低 DiT attention/RoPE 峰值或做重复压力测试。
+
+## 37. 单卡预处理 buffer 与 Self Q/K/V 提前释放（2026-08-31）
+
+- segment 预处理完成紧凑 DiT 输入后，立即释放 `pose_segment`、`smpl_render_video`、`driving_mask_segment` 和 `null_noisy_mask`，合计约 653.9 MiB。单卡 VAE-offload 路径在 diffusion 前归还对应 allocator cache；普通 FSDP 路径不新增 cache flush。
+- Self-attention 中 Q 完成 RoPE 后释放原始 Q，K 完成 RoPE 后释放原始 K；FlashAttention 返回后释放 `q_rope`、`k_rope` 和 V。每份 Q/K/V 约 476.9 MiB，计算顺序和数值路径不变。
+- probe 日志为 `experiment_logs/single_gpu/101-20260831-132638.log`。block 0 最高 phase peak 从仅 VAE CPU 的 37113.5 MiB 降至 36278.3 MiB，减少 835.2 MiB；整次 probe NVML 峰值从 39527 降至 38867 MiB，减少 660 MiB。最高点已从 K RoPE 转移到 Self/Cross QKV 和 FFN residual 附近。首步 latent SHA-256 仍为 `f6845ee32b24e01bb80b8f6dfa3467c62119bb3014ef94f65718a40bd8085261`。
+- 完整日志为 `experiment_logs/single_gpu/101-20260831-132759.log`，输出为 `experiment_outputs/single_gpu/101-20260831-132759.mp4`。4 个 segment、24 个 diffusion step、在线 CLIP、VAE CPU residency、7-block VAE 阶段 offload/reload 和音频 mux 全部成功，exit code 0。
+- 完整 NVML 峰值为 39249/40960 MiB，比仅 VAE CPU 对照的 39949 MiB 再降 700 MiB，比未移动 VAE 的 40441 MiB 降 1192 MiB；物理余量达到 1711 MiB（4.18%）。请求用时 436.526 秒，未观察到可归因于提前释放的性能损失。
+- 最终 MP4 为 19587416 bytes，SHA-256=`7039c5f231eb64b544c4aa288ea5107411c9e7f51bdcf4c93d125d6e1610680a`，与双卡基准逐字节一致。下一批局部高点已接近：Self/Cross QKV 与 FFN residual 均约 36278 MiB，继续降低峰值需要同时处理这些阶段，而不是只优化 RoPE。
