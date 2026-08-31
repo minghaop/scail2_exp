@@ -24,7 +24,6 @@ def _checkpoint_fields(path: Path) -> dict[str, str]:
     return {
         "t5_checkpoint_name": resolved.name,
         "t5_checkpoint_bytes": str(stat.st_size),
-        "t5_checkpoint_mtime_ns": str(stat.st_mtime_ns),
     }
 
 
