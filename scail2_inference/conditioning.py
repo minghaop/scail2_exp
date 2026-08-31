@@ -60,11 +60,25 @@ def build_t5_metadata(
     )
     metadata.update(
         {
+            "prompt": prompt,
             "prompt_sha256": _sha256_bytes(prompt),
             "negative_prompt_sha256": _sha256_bytes(negative_prompt),
         }
     )
     return metadata
+
+
+def _validate_metadata(metadata: Mapping[str, str]) -> None:
+    if metadata.get("schema") != SCHEMA_VERSION:
+        raise ValueError(f"Invalid T5 cache schema: {metadata.get('schema')!r}")
+    prompt = metadata.get("prompt")
+    if not isinstance(prompt, str) or not prompt:
+        raise ValueError("T5 cache metadata is missing prompt")
+    for field_name in ("prompt_sha256", "negative_prompt_sha256"):
+        if not metadata.get(field_name):
+            raise ValueError(f"T5 cache metadata is missing {field_name}")
+    if metadata["prompt_sha256"] != _sha256_bytes(prompt):
+        raise ValueError("T5 cache prompt does not match prompt_sha256")
 
 
 def _validate_tensors(tensors: Mapping[str, object]) -> None:
@@ -106,11 +120,7 @@ def save_t5_cache(
     if target.exists() and not overwrite:
         raise FileExistsError(f"T5 cache already exists: {target}")
     _validate_tensors(tensors)
-    if metadata.get("schema") != SCHEMA_VERSION:
-        raise ValueError(f"Invalid T5 cache schema: {metadata.get('schema')!r}")
-    for field_name in ("prompt_sha256", "negative_prompt_sha256"):
-        if not metadata.get(field_name):
-            raise ValueError(f"T5 cache metadata is missing {field_name}")
+    _validate_metadata(metadata)
     target.parent.mkdir(parents=True, exist_ok=True)
     temp = target.with_name(f".{target.name}.inprogress-{os.getpid()}")
     try:
@@ -137,6 +147,7 @@ def load_t5_cache(
     with safe_open(source, framework="pt", device="cpu") as handle:
         actual = handle.metadata() or {}
         keys = set(handle.keys())
+    _validate_metadata(actual)
     if keys != TENSOR_NAMES:
         raise ValueError(
             "T5 cache tensor names mismatch: "

@@ -13,8 +13,9 @@
 - driving mask
 - 预先生成并校验过的 T5 cache
 
-prompt 不再进入在线推理接口。使用 `prepare_conditioning.py` 在推理前生成 T5
-cache；在线推理仍会用 reference image 计算 CLIP context。
+prompt 不再进入在线推理接口。使用 `t5_precache_service` HTTP 服务生成 T5
+cache；在线推理仍会用 reference image 计算 CLIP context。服务用法见
+`t5_precache_service/README.zh-CN.md`。
 
 ## 生命周期
 
