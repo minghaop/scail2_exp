@@ -1,11 +1,10 @@
 #!/home/panminghao/miniconda3/envs/scail2-single-gpu/bin/python
-"""Precompute the fixed T5 and CLIP conditioning for one experiment input."""
+"""Precompute a validated T5 cache for one inference prompt."""
 
 from __future__ import annotations
 
 import argparse
 import codecs
-import gc
 import json
 import os
 import subprocess
@@ -22,12 +21,11 @@ from run_fsdp_experiment import (
     PYTHON_BIN,
     ROOT,
     TEST_CASE,
-    TEST_CASE_DIR,
     TimestampedLogWriter,
 )
 
 
-DEFAULT_OUTPUT = ROOT / "experiment_cache/conditioning" / f"{TEST_CASE}.safetensors"
+DEFAULT_OUTPUT = ROOT / "experiment_cache/t5" / f"{TEST_CASE}.safetensors"
 ALLOWED_PHYSICAL_GPUS = frozenset(("0", "1", "2", "3", "6", "7"))
 
 
@@ -35,7 +33,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--negative-prompt", default="")
-    parser.add_argument("--reference-image", type=Path, default=TEST_CASE_DIR / "reference_image.png")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--physical-gpu", default="2")
     parser.add_argument("--overwrite", action="store_true")
@@ -51,9 +48,6 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if not args.prompt.strip():
         raise ValueError("Prompt cannot be empty")
-    reference = args.reference_image.resolve(strict=True)
-    if not reference.is_file() or reference.stat().st_size == 0:
-        raise FileNotFoundError(f"Invalid reference image: {reference}")
     if not CHECKPOINT_DIR.is_dir():
         raise FileNotFoundError(f"Invalid checkpoint directory: {CHECKPOINT_DIR}")
 
@@ -73,8 +67,6 @@ def launch_worker(args: argparse.Namespace) -> None:
         args.prompt,
         "--negative-prompt",
         args.negative_prompt,
-        "--reference-image",
-        str(args.reference_image.resolve()),
         "--output",
         str(args.output.resolve()),
     ]
@@ -89,7 +81,7 @@ def launch_worker(args: argparse.Namespace) -> None:
     }
     header = (
         f"Log file: {log_path}\n"
-        f"Preparing T5/CLIP conditioning on physical GPU {args.physical_gpu}\n"
+        f"Preparing T5 cache on physical GPU {args.physical_gpu}\n"
         + " ".join(command)
         + "\n"
     )
@@ -127,23 +119,16 @@ def launch_worker(args: argparse.Namespace) -> None:
 def run_worker(args: argparse.Namespace) -> None:
     started = time.monotonic()
     import torch
-    from PIL import Image
 
     from scail2_inference.conditioning import (
-        CLIP_CONTEXT,
         NEGATIVE_CONTEXT,
         TEXT_CONTEXT,
-        expected_metadata,
-        save_conditioning,
+        build_t5_metadata,
+        save_t5_cache,
     )
     from scail2_inference.contracts import ProductionProfile
     from wan.configs import SCAIL_CONFIGS
-    from wan.modules.clip import CLIPModel
     from wan.modules.t5 import T5EncoderModel
-    from wan.utils.scail_utils import (
-        load_image_to_tensor_chw_normalized,
-        resize_for_rectangle_crop,
-    )
 
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     if visible != args.physical_gpu:
@@ -155,7 +140,6 @@ def run_worker(args: argparse.Namespace) -> None:
     profile = ProductionProfile.from_name(PROFILE_NAME)
     cfg = SCAIL_CONFIGS[profile.model.upper()]
     t5_checkpoint = CHECKPOINT_DIR / cfg.t5_checkpoint
-    clip_checkpoint = CHECKPOINT_DIR / cfg.clip_checkpoint
 
     torch.cuda.reset_peak_memory_stats(device)
     stage_started = time.monotonic()
@@ -181,70 +165,19 @@ def run_worker(args: argparse.Namespace) -> None:
         f"negative_shape={tuple(negative_context.shape)}",
         flush=True,
     )
-    del text_encoder
-    gc.collect()
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize(device)
-
-    torch.cuda.reset_peak_memory_stats(device)
-    stage_started = time.monotonic()
-    print("SCAIL2_PREPROCESS stage=clip status=start", flush=True)
-    clip = CLIPModel(
-        dtype=cfg.clip_dtype,
-        device=device,
-        checkpoint_path=str(clip_checkpoint),
-        tokenizer_path=str(CHECKPOINT_DIR / cfg.clip_tokenizer),
-    )
-    image = Image.open(args.reference_image).convert("RGB")
-    image_tensor = load_image_to_tensor_chw_normalized(image).to(device)
-    _, _, source_height, source_width = image_tensor.shape
-    target_height = profile.target_height
-    target_width = profile.target_width
-    source_landscape = source_width > source_height
-    target_landscape = target_width > target_height
-    if source_landscape != target_landscape:
-        raise ValueError(
-            "Reference image orientation does not match the production profile: "
-            f"source={source_width}x{source_height}, "
-            f"target={target_width}x{target_height}"
-        )
-    image_tensor = resize_for_rectangle_crop(
-        image_tensor,
-        (target_height, target_width),
-        reshape_mode="center",
-    ).squeeze(0)
-    with torch.inference_mode():
-        clip_context = (
-            clip.visual([image_tensor[:, None, :, :]])
-            .detach()
-            .cpu()
-            .contiguous()
-        )
-    torch.cuda.synchronize(device)
-    print(
-        "SCAIL2_PREPROCESS stage=clip status=complete "
-        f"elapsed_seconds={time.monotonic() - stage_started:.3f} "
-        f"peak_allocated_mib={torch.cuda.max_memory_allocated(device) / 2**20:.1f} "
-        f"clip_shape={tuple(clip_context.shape)}",
-        flush=True,
-    )
-
-    metadata = expected_metadata(
+    metadata = build_t5_metadata(
         prompt=args.prompt,
         negative_prompt=args.negative_prompt,
-        reference_image=args.reference_image,
-        target_width=target_width,
-        target_height=target_height,
+        profile=profile.name,
+        text_len=cfg.text_len,
         t5_checkpoint=t5_checkpoint,
-        clip_checkpoint=clip_checkpoint,
     )
     output = args.output.resolve()
-    save_conditioning(
+    save_t5_cache(
         output,
         {
             TEXT_CONTEXT: text_context,
             NEGATIVE_CONTEXT: negative_context,
-            CLIP_CONTEXT: clip_context,
         },
         metadata,
         overwrite=args.overwrite,
@@ -256,7 +189,6 @@ def run_worker(args: argparse.Namespace) -> None:
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "text_shape": list(text_context.shape),
         "negative_shape": list(negative_context.shape),
-        "clip_shape": list(clip_context.shape),
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
 

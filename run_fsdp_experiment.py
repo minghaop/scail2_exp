@@ -43,7 +43,6 @@ DEFAULT_PROMPT = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument(
         "--output",
         type=Path,
@@ -53,9 +52,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
-        "--conditioning-cache",
+        "--t5-cache",
         type=Path,
-        help="Use a validated T5/CLIP conditioning artifact and skip both models.",
+        default=ROOT / "experiment_cache/t5" / f"{TEST_CASE}.safetensors",
+        help="Validated T5-only conditioning cache.",
     )
     parser.add_argument(
         "--physical-gpus",
@@ -305,7 +305,6 @@ def resolved_payload(args: argparse.Namespace) -> dict[str, object]:
     return {
         "case": TEST_CASE,
         "job_id": job_id,
-        "prompt": args.prompt,
         "seed": args.seed,
         "overwrite": args.overwrite,
         "init_only": args.init_only,
@@ -321,12 +320,7 @@ def resolved_payload(args: argparse.Namespace) -> dict[str, object]:
         "checkpoint_dir": CHECKPOINT_DIR,
         "dit_checkpoint": DIT_CHECKPOINT,
         "dit_meta_load": True,
-        "t5_meta_load": args.conditioning_cache is None,
-        "conditioning_cache": (
-            None
-            if args.conditioning_cache is None
-            else args.conditioning_cache.resolve()
-        ),
+        "t5_cache": args.t5_cache.resolve(),
         "physical_gpus": physical_gpus,
         "output_audio": OUTPUT_AUDIO_MODE,
         "output": output,
@@ -349,17 +343,13 @@ def validate_static_paths(payload: dict[str, object]) -> None:
         path = payload[key]
         if not isinstance(path, Path) or not path.is_file() or path.stat().st_size == 0:
             raise FileNotFoundError(f"Invalid {key}: {path}")
-    conditioning_cache = payload["conditioning_cache"]
-    if conditioning_cache is not None and (
-        not isinstance(conditioning_cache, Path)
-        or not conditioning_cache.is_file()
-        or conditioning_cache.stat().st_size == 0
+    t5_cache = payload["t5_cache"]
+    if (
+        not isinstance(t5_cache, Path)
+        or not t5_cache.is_file()
+        or t5_cache.stat().st_size == 0
     ):
-        raise FileNotFoundError(
-            f"Invalid conditioning_cache: {conditioning_cache}"
-        )
-    if not str(payload["prompt"]).strip():
-        raise ValueError("Prompt cannot be empty")
+        raise FileNotFoundError(f"Invalid t5_cache: {t5_cache}")
     if int(payload["seed"]) < 0:
         raise ValueError("Seed must be nonnegative")
     output = payload["output"]
@@ -458,11 +448,7 @@ def launch_workers(payload: dict[str, object]) -> None:
     header = (
         f"Log file: {log_path}\n"
         f"Launching two-GPU FSDP on physical GPUs {','.join(physical_gpus)}:\n"
-        + (
-            "Load modes: T5=precomputed, CLIP=precomputed, DiT=meta-assign\n"
-            if payload["conditioning_cache"] is not None
-            else "Load modes: T5=meta-assign, CLIP=standard, DiT=meta-assign\n"
-        )
+        + "Load modes: T5=file cache, CLIP=online, DiT=meta-assign\n"
         + f"FSDP diagnostics: {'enabled' if payload['diagnose_fsdp'] else 'disabled'}\n"
         + f"DiT memory probe: {'enabled' if payload['memory_probe'] else 'disabled'}\n"
         + f"Comparison trace: {'enabled' if payload['compare_trace'] else 'disabled'}\n"
@@ -555,11 +541,16 @@ def run_worker(args: argparse.Namespace, payload: dict[str, object]) -> None:
         scail_checkpoint=Path(payload["dit_checkpoint"]),
         profile=profile,
         expected_world_size=2,
-        t5_fsdp=payload["conditioning_cache"] is None,
-        t5_meta_load=bool(payload["t5_meta_load"]),
+        initialize_process_group=True,
+        t5_fsdp=False,
         dit_fsdp=True,
         dit_meta_load=bool(payload["dit_meta_load"]),
-        precomputed_conditioning=payload["conditioning_cache"] is not None,
+        dit_init_on_cpu=True,
+        keep_dit_cpu_state_dict=False,
+        vae_dit_offload_blocks=0,
+        offload_vae_during_dit=False,
+        precomputed_conditioning=True,
+        online_clip_conditioning=True,
         offload_model=False,
         output_audio_mode=str(payload["output_audio"]),
     )
@@ -569,13 +560,8 @@ def run_worker(args: argparse.Namespace, payload: dict[str, object]) -> None:
         reference_mask=Path(payload["reference_mask"]),
         driving_video=Path(payload["driving_video"]),
         driving_mask=Path(payload["driving_mask"]),
-        prompt=str(payload["prompt"]),
+        t5_cache_path=Path(payload["t5_cache"]),
         output_path=Path(payload["output"]),
-        conditioning_path=(
-            None
-            if payload["conditioning_cache"] is None
-            else Path(payload["conditioning_cache"])
-        ),
         seed=int(payload["seed"]),
         overwrite=bool(payload["overwrite"]),
         metadata={"test_case": str(payload["case"]), "launcher": "cli-fsdp"},
@@ -688,13 +674,12 @@ def main() -> None:
             int(item) for item in payload["physical_gpus"]
         ]
         printable["world_size"] = 2
-        printable["t5_fsdp"] = payload["conditioning_cache"] is None
+        printable["t5_fsdp"] = False
         printable["dit_fsdp"] = True
-        printable["t5_meta_load"] = bool(payload["t5_meta_load"])
+        printable["t5_meta_load"] = False
         printable["dit_meta_load"] = True
-        printable["precomputed_conditioning"] = (
-            payload["conditioning_cache"] is not None
-        )
+        printable["precomputed_conditioning"] = True
+        printable["online_clip_conditioning"] = True
         print(json.dumps(printable, ensure_ascii=False, indent=2, sort_keys=True))
         return
     if args.worker:

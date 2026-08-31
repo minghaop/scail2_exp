@@ -2,6 +2,11 @@
 
 日期：2026-08-27
 
+> 2026-08-31 更新：本文主体记录的是早期 T5/CLIP 混合缓存实验，现已被
+> `scail2-t5-cache-v1` 取代。当前运行时接口只接收 `t5_cache_path`，文件中
+> 仅含 `text_context` 和 `negative_context`；CLIP 根据每次请求的 reference
+> image 在线计算。当前实现与验证结果见 `SCAIL2_EXPERIMENT_CONTEXT.md` 第 39 节。
+
 ## 1. 目标
 
 将 T5 文本编码和 CLIP 参考图编码从 DiT 主推理 worker 中移出，提前生成可复用的 conditioning cache。主推理只加载 VAE、DiT 和缓存 tensor，不再构造或加载 T5、CLIP 模型。

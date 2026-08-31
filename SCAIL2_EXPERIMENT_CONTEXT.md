@@ -573,3 +573,14 @@ wan/distributed/fsdp.py，以及 experiment_logs 下的两份日志。
 - Engine load 为 12.329 秒，比在线 CLIP/BF16 入口回归的 17.835 秒少 5.506 秒。请求 started-to-finished 为 434.250 秒，比上一轮 436.526 秒少 2.276 秒；三个 81 帧 segment 平均 16.73/16.71/16.70 秒/步，57 帧 segment 为 10.32 秒/步，核心 DiT 性能无实质变化。
 - VAE 的 17 次 CPU/GPU 迁移累计 4.632 秒；4 次 DiT block offload/reload 合计 6.362 秒；audio mux 为 2.444 秒。NVML 峰值为 38941/40960 MiB，物理余量 2019 MiB（4.93%），比上一轮 39249 MiB 再低 308 MiB。最终 RSS 为 34096.6 MiB，比在线 CLIP版本低 2613.5 MiB。
 - 新输出为 19652849 bytes，SHA-256=`fcb0871b57305440b8cd33ab8e3960a7d8f81f68c401190addda80ac59137d7e`；与历史不转换但在线执行 CLIP 的 `101-20260828-191836.mp4` 完全相同，H.264 和 AAC stream 也分别逐字节一致。由此确认 cached CLIP 与在线 CLIP 在新标准下结果一致。
+
+## 39. 单卡持久服务生命周期与 T5 文件接口回归（2026-08-31）
+
+- 公共 `InferenceJob` 已移除 prompt 和旧 `conditioning_path`，改为必填 `t5_cache_path`。新缓存 schema 为 `scail2-t5-cache-v1`，只保存 BF16 `text_context` 与 `negative_context`；CLIP context 不再写入缓存，运行时始终依据本次 reference image 在线计算。旧的 T5/CLIP 混合缓存会因 tensor/schema 契约不同被明确拒绝。
+- 新缓存由 `prepare_conditioning.py` 生成，固定样例为 `experiment_cache/t5/101.safetensors`，大小 762432 bytes；日志为 `experiment_logs/conditioning/101-20260831-150214.log`。T5 阶段 5.748 秒，peak allocated 11088.6 MiB；缓存 tensor 为 `[92,4096]` 与 `[1,4096]`，不再绑定 reference image 或 CLIP checkpoint。
+- 单卡生产默认驻留状态改为：完整 BF16 DiT、VAE、CLIP 均在 GPU，完整 DiT mmap CPU master 保留。初始化日志 `experiment_logs/single_gpu/101-20260831-150254.log` 验证 READY 时三模型均为 CUDA；CUDA allocated=32961.7 MiB，NVML used=33467 MiB，CPU master 与 GPU DiT 各为 31272.0 MiB。
+- 每次请求先用 GPU CLIP 完成 reference encode 并将 CLIP 卸载到 CPU。每个 segment 先在 GPU 完成 VAE pose encode，再将 VAE 移到 CPU执行完整 DiT diffusion；之后卸载 DiT blocks 33--39，加载 VAE 完成 decode/history encode，在 VAE 保持 GPU 的情况下恢复 7 个 DiT block。下一段 pose encode 后才再次卸载 VAE。4 个 segment 的 VAE 迁移从旧实现的 17 次降为 8 次；请求结束后重新加载 CLIP并校验 READY 驻留。
+- 单次完整回归日志 `experiment_logs/single_gpu/101-20260831-150319.log`：297 帧、4 个 segment、24 个 diffusion step、音频合并和最终 READY 恢复全部成功。请求耗时 437.891 秒，CUDA allocated 峰值 36819.1 MiB，NVML 峰值 39491/40960 MiB。输出 `101-20260831-150319.mp4` 的 SHA-256 为 `fcb0871b57305440b8cd33ab8e3960a7d8f81f68c401190addda80ac59137d7e`，与当前 FP16 context 标准输出逐字节一致。
+- 同一 engine 连续两次最终回归日志为 `experiment_logs/single_gpu/101-20260831-152730.log`。两次耗时 435.951/430.966 秒，CUDA allocated 峰值均为 36819.1 MiB，输出 SHA-256 均为 `fcb0871b...37d7e`；每次结束后的 allocated 均为 32977.8 MiB，VAE、CLIP、完整 DiT 均恢复 CUDA，证明 GPU 侧无逐请求累积。
+- CPU master 的初始 RSS 分解为 file-backed 31516.6 MiB、anonymous 461.6 MiB，符合 safetensors mmap 设计。为避免视频拼接和模型迁移形成 glibc heap 高水位，请求 finally 中增加 best-effort `malloc_trim(0)`；连续两次结束后的 RSS 为 33094.9/33149.1 MiB，其中 file-backed 均为 31588.4 MiB，anonymous 仅相差约 54 MiB，未再出现未回收版本中每次增加 GiB 级 RSS 的现象。
+- Dispatcher 服务输入契约同步改为五个文件：reference image/mask、driving video/mask 和 T5 cache，不再接收 prompt；单卡生产 `EngineConfig` 默认值和 worker 配置均采用上述驻留/迁移策略。调用仍由 runtime lock 和单任务 Backend 串行化；普通输入/输出契约失败恢复 READY，CUDA/模型异常进入 ERROR 并由外部重启 worker。

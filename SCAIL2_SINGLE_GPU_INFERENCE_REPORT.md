@@ -2,6 +2,12 @@
 
 日期：2026-08-28
 
+> 2026-08-31 更新：本文主体记录的是单卡化的初始实验版本。当前持久服务在
+> READY 状态保持完整 DiT、VAE、CLIP 位于 GPU；每个 segment 只在 DiT
+> diffusion 期间卸载 VAE，VAE 迁移由 17 次降为 8 次，运行时改用 T5-only
+> 文件接口，并已通过同一 engine 连续两次完整推理。最新数据见
+> `SCAIL2_EXPERIMENT_CONTEXT.md` 第 39 节。
+
 ## 1. 结论
 
 SCAIL2 已完成从双卡 FSDP 到单卡推理的实验性改造，并在一张 A100-SXM4-40GB 上跑通完整 297 帧流程。

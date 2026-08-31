@@ -104,20 +104,20 @@ class EngineConfig:
     scail_checkpoint: Path
     scail_config_path: Path | None = None
     profile: ProductionProfile = field(default_factory=ProductionProfile)
-    expected_world_size: int | None = 2
+    expected_world_size: int | None = 1
     distributed_backend: str = "nccl"
-    initialize_process_group: bool = True
-    t5_fsdp: bool = True
+    initialize_process_group: bool = False
+    t5_fsdp: bool = False
     t5_meta_load: bool = False
-    dit_fsdp: bool = True
+    dit_fsdp: bool = False
     cast_dit_forward_inputs: bool = False
-    dit_meta_load: bool = False
-    dit_init_on_cpu: bool = True
-    keep_dit_cpu_state_dict: bool = False
-    vae_dit_offload_blocks: int = 0
-    offload_vae_during_dit: bool = False
-    precomputed_conditioning: bool = False
-    online_clip_conditioning: bool = False
+    dit_meta_load: bool = True
+    dit_init_on_cpu: bool = False
+    keep_dit_cpu_state_dict: bool = True
+    vae_dit_offload_blocks: int = 7
+    offload_vae_during_dit: bool = True
+    precomputed_conditioning: bool = True
+    online_clip_conditioning: bool = True
     t5_cpu: bool = False
     offload_model: bool = False
     output_audio_mode: str = "none"
@@ -136,9 +136,17 @@ class EngineConfig:
             raise EnvironmentValidationError(
                 "precomputed_conditioning requires t5_fsdp=False"
             )
+        if not self.precomputed_conditioning:
+            raise EnvironmentValidationError(
+                "The inference interface requires a precomputed T5 cache"
+            )
         if self.online_clip_conditioning and not self.precomputed_conditioning:
             raise EnvironmentValidationError(
                 "online_clip_conditioning requires precomputed_conditioning=True"
+            )
+        if self.precomputed_conditioning and not self.online_clip_conditioning:
+            raise EnvironmentValidationError(
+                "The T5-cache interface requires online_clip_conditioning=True"
             )
         if self.offload_model:
             raise EnvironmentValidationError(
@@ -230,9 +238,8 @@ class InferenceJob:
     reference_mask: Path
     driving_video: Path
     driving_mask: Path
-    prompt: str
+    t5_cache_path: Path
     output_path: Path
-    conditioning_path: Path | None = None
     output_fps_fraction: str | None = None
     expected_output_frames: int | None = None
     expected_output_duration: float | None = None
@@ -243,8 +250,6 @@ class InferenceJob:
     def validate(self, *, check_paths: bool = True) -> None:
         if not self.job_id.strip():
             raise InputValidationError("job_id cannot be empty")
-        if not self.prompt.strip():
-            raise InputValidationError(f"Job {self.job_id} has an empty prompt")
         if self.seed is not None and self.seed < 0:
             raise InputValidationError(f"Job {self.job_id} seed must be nonnegative")
         if self.output_fps_fraction is not None:
@@ -278,20 +283,13 @@ class InferenceJob:
                 ("reference mask", self.reference_mask),
                 ("driving video", self.driving_video),
                 ("driving mask", self.driving_mask),
+                ("T5 cache", self.t5_cache_path),
             ):
                 candidate = Path(path)
                 if not candidate.is_file() or candidate.stat().st_size == 0:
                     raise InputValidationError(
                         f"Job {self.job_id} has invalid {label}: {candidate}"
                     )
-            if self.conditioning_path is not None:
-                candidate = Path(self.conditioning_path)
-                if not candidate.is_file() or candidate.stat().st_size == 0:
-                    raise InputValidationError(
-                        f"Job {self.job_id} has invalid conditioning artifact: "
-                        f"{candidate}"
-                    )
-
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         for field_name in (
@@ -299,14 +297,10 @@ class InferenceJob:
             "reference_mask",
             "driving_video",
             "driving_mask",
+            "t5_cache_path",
             "output_path",
         ):
             payload[field_name] = str(payload[field_name])
-        payload["conditioning_path"] = (
-            None
-            if payload["conditioning_path"] is None
-            else str(payload["conditioning_path"])
-        )
         payload["metadata"] = dict(self.metadata)
         return payload
 
@@ -318,11 +312,10 @@ class InferenceJob:
             "reference_mask",
             "driving_video",
             "driving_mask",
+            "t5_cache_path",
             "output_path",
         ):
             values[field_name] = Path(values[field_name])
-        if values.get("conditioning_path") is not None:
-            values["conditioning_path"] = Path(values["conditioning_path"])
         return cls(**values)
 
 

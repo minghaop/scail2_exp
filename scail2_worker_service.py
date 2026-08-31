@@ -1,8 +1,8 @@
 """Dispatcher-compatible WebSocket worker for the SCAIL-2 inference SDK.
 
-The module is intentionally self-contained.  Rank 0 hosts the WebSocket server
-and owns a single-job Backend; rank 1 only participates in the distributed SDK
-runtime.  Inputs and the output MP4 live under ``/dev/shm/<rank-0-pid>``.
+The module is intentionally self-contained.  One process owns the WebSocket
+server and a serial single-job Backend.  Inputs and the output MP4 live under
+``/dev/shm/<pid>``.
 """
 
 import argparse
@@ -35,7 +35,7 @@ DIT_CHECKPOINT = Path(
     "SCAIL-2-lightx2v-r128-dpo-alpha1-full-bf16.safetensors"
 )
 PROFILE_NAME = "scail2-512p-bf16-v1"
-EXPECTED_WORLD_SIZE = 2
+EXPECTED_WORLD_SIZE = 1
 OUTPUT_AUDIO_MODE = "driving"
 
 DOWNLOAD_TIMEOUT_SECONDS = 300.0
@@ -53,8 +53,10 @@ PATH_PARAM_FIELDS = (
     "reference_mask",
     "driving_video",
     "driving_mask",
+    "t5_cache",
 )
-REQUIRED_PARAM_FIELDS = (*PATH_PARAM_FIELDS, "prompt")
+REQUIRED_PARAM_FIELDS = PATH_PARAM_FIELDS
+
 
 def unix_milliseconds() -> int:
     return int(time.time() * 1000)
@@ -134,10 +136,6 @@ def validate_submission(message: Mapping[str, Any]) -> ValidatedSubmission:
     for field_name in REQUIRED_PARAM_FIELDS:
         if field_name not in params:
             raise SubmissionError(f"params.{field_name} is required")
-    prompt = _required_nonempty_string(params["prompt"], "params.prompt").strip()
-    if len(prompt) > 16384:
-        raise SubmissionError("params.prompt is too long")
-    params["prompt"] = prompt
     for field_name in PATH_PARAM_FIELDS:
         _relative_path(params[field_name], f"params.{field_name}")
 
@@ -162,7 +160,9 @@ def validate_submission(message: Mapping[str, Any]) -> ValidatedSubmission:
     if not isinstance(downloads_value, list) or len(downloads_value) != len(
         PATH_PARAM_FIELDS
     ):
-        raise SubmissionError("s3.downloads must contain exactly four inputs")
+        raise SubmissionError(
+            f"s3.downloads must contain exactly {len(PATH_PARAM_FIELDS)} inputs"
+        )
     downloads: list[DownloadSpec] = []
     destinations: set[PurePosixPath] = set()
     for index, item in enumerate(downloads_value):
@@ -611,7 +611,7 @@ class DispatcherWorkerService:
             reference_mask=reference_mask,
             driving_video=local_path("driving_video"),
             driving_mask=local_path("driving_mask"),
-            prompt=params["prompt"],
+            t5_cache_path=local_path("t5_cache"),
             output_path=self._work_dir / f"{job_id}.mp4",
             overwrite=False,
             metadata={"source": "dispatcher", "handle": submission.handle},
@@ -845,8 +845,16 @@ def main() -> None:
         scail_checkpoint=DIT_CHECKPOINT,
         profile=profile,
         expected_world_size=EXPECTED_WORLD_SIZE,
-        t5_fsdp=True,
-        dit_fsdp=True,
+        initialize_process_group=False,
+        t5_fsdp=False,
+        dit_fsdp=False,
+        dit_meta_load=True,
+        dit_init_on_cpu=False,
+        keep_dit_cpu_state_dict=True,
+        vae_dit_offload_blocks=7,
+        offload_vae_during_dit=True,
+        precomputed_conditioning=True,
+        online_clip_conditioning=True,
         offload_model=False,
         output_audio_mode=OUTPUT_AUDIO_MODE,
     )

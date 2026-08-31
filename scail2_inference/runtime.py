@@ -1,4 +1,4 @@
-"""Two-rank persistent worker loop with a service-owned job backend."""
+"""Persistent worker loop with a service-owned serial job backend."""
 
 from __future__ import annotations
 
@@ -34,12 +34,12 @@ class JobBackend(Protocol):
 
 
 class Scail2DistributedRuntime:
-    """Keep one engine resident and dispatch rank-0 jobs to every rank.
+    """Keep one engine resident and dispatch serial jobs to every rank.
 
     Model collectives use the engine's default NCCL process group. Runtime
-    commands use a separate CPU/Gloo group, while rank 0 acquires jobs in a
-    daemon thread. This lets every rank exchange an idle heartbeat without
-    leaving a GPU occupied by an unmatched NCCL collective.
+    Distributed commands use a separate CPU/Gloo group, while rank 0 acquires
+    jobs in a daemon thread. This lets every rank exchange an idle heartbeat
+    without leaving a GPU occupied by an unmatched NCCL collective.
     """
 
     def __init__(

@@ -520,11 +520,7 @@ class SCAIL2Pipeline:
             )
             self.clip = CLIPModel(
                 dtype=config.clip_dtype,
-                device=(
-                    torch.device("cpu")
-                    if self.online_clip_conditioning
-                    else self.device
-                ),
+                device=self.device,
                 checkpoint_path=clip_checkpoint_path,
                 tokenizer_path=os.path.join(checkpoint_dir, config.clip_tokenizer))
             _emit_pipeline_init_event(
@@ -532,9 +528,7 @@ class SCAIL2Pipeline:
                 "clip_load",
                 "complete",
                 started_at=clip_started,
-                resident_device=(
-                    "cpu" if self.online_clip_conditioning else str(self.device)
-                ),
+                resident_device=str(self.device),
             )
 
         logging.info(
@@ -907,8 +901,8 @@ class SCAIL2Pipeline:
     def _encode_online_clip_and_offload(self, img):
         if not self.online_clip_conditioning or self.clip is None:
             raise RuntimeError("Online CLIP conditioning is unavailable")
-        if any(parameter.is_cuda for parameter in self.clip.model.parameters()):
-            raise RuntimeError("CLIP must be CPU-resident before reference encoding")
+        if not all(parameter.is_cuda for parameter in self.clip.model.parameters()):
+            raise RuntimeError("CLIP must be CUDA-resident before reference encoding")
 
         torch.cuda.synchronize(self.device)
         torch.cuda.reset_peak_memory_stats(self.device)
@@ -921,15 +915,14 @@ class SCAIL2Pipeline:
         )
         clip_context = None
         try:
-            self.clip.model.to(self.device)
             clip_context = self.clip.visual([img[:, None, :, :]])
             torch.cuda.synchronize(self.device)
             peak_allocated = torch.cuda.max_memory_allocated(self.device)
         finally:
-            self.clip.model.cpu()
-            gc.collect()
-            torch.cuda.synchronize(self.device)
-            torch.cuda.empty_cache()
+            self._switch_clip_device(
+                to_cuda=False,
+                reason="reference_encode_complete",
+            )
 
         after_allocated = torch.cuda.memory_allocated(self.device)
         free, total = torch.cuda.mem_get_info(self.device)
@@ -944,6 +937,74 @@ class SCAIL2Pipeline:
             tuple(clip_context.shape),
         )
         return clip_context
+
+    def _switch_clip_device(self, *, to_cuda, reason):
+        if self.clip is None:
+            return
+        target = self.device if to_cuda else torch.device("cpu")
+        parameters = list(self.clip.model.parameters())
+        current_devices = {parameter.device.type for parameter in parameters}
+        if current_devices == {target.type}:
+            return
+        if len(current_devices) != 1:
+            raise RuntimeError(
+                "CLIP has mixed parameter residency before device switch: "
+                f"{sorted(current_devices)}"
+            )
+        torch.cuda.synchronize(self.device)
+        started = time.monotonic()
+        before_allocated = torch.cuda.memory_allocated(self.device)
+        self.clip.model.to(target)
+        resulting_devices = {
+            parameter.device.type for parameter in self.clip.model.parameters()
+        }
+        if resulting_devices != {target.type}:
+            raise RuntimeError(
+                f"Failed to move CLIP to {target}: {sorted(resulting_devices)}"
+            )
+        gc.collect()
+        torch.cuda.synchronize(self.device)
+        torch.cuda.empty_cache()
+        after_allocated = torch.cuda.memory_allocated(self.device)
+        logging.info(
+            "SCAIL2_CLIP_PHASE action=%s reason=%s elapsed_seconds=%.3f "
+            "allocated_before_mib=%.1f allocated_after_mib=%.1f",
+            "load" if to_cuda else "offload",
+            reason,
+            time.monotonic() - started,
+            before_allocated / 2**20,
+            after_allocated / 2**20,
+        )
+
+    def assert_ready_residency(self):
+        non_cuda_dit = sum(
+            1 for parameter in self.model.parameters() if not parameter.is_cuda
+        )
+        if non_cuda_dit:
+            raise RuntimeError(
+                f"READY residency has {non_cuda_dit} non-CUDA DiT parameters"
+            )
+        if self._vae_offloaded_dit_blocks:
+            raise RuntimeError("READY residency still has offloaded DiT blocks")
+        if any(not parameter.is_cuda for parameter in self.vae.model.parameters()):
+            raise RuntimeError("READY residency requires VAE on CUDA")
+        if self.vae.mean.device.type != "cuda" or self.vae.std.device.type != "cuda":
+            raise RuntimeError("READY residency requires VAE scale tensors on CUDA")
+        if self.clip is not None and any(
+            not parameter.is_cuda for parameter in self.clip.model.parameters()
+        ):
+            raise RuntimeError("READY residency requires CLIP on CUDA")
+        logging.info(
+            "SCAIL2_RESIDENCY state=ready dit=cuda vae=cuda clip=%s",
+            "cuda" if self.clip is not None else "unloaded",
+        )
+
+    def restore_ready_residency(self, *, reason):
+        if self._vae_offloaded_dit_blocks:
+            self._switch_vae_dit_blocks(to_cuda=True)
+        self._switch_vae_device(to_cuda=True, reason=reason)
+        self._switch_clip_device(to_cuda=True, reason=reason)
+        self.assert_ready_residency()
 
     def _switch_vae_device(self, *, to_cuda, reason):
         if not self.offload_vae_during_dit:
@@ -1184,6 +1245,49 @@ class SCAIL2Pipeline:
                 f"Sampling {len(segments)} segments with segment_len={segment_len}, "
                 f"segment_overlap={segment_overlap}.")
 
+        if n_prompt is None:
+            n_prompt = ""
+        if conditioning is not None:
+            required = {"text_context", "negative_context"}
+            if set(conditioning) != required:
+                raise ValueError(
+                    "Precomputed conditioning keys mismatch: "
+                    f"expected {sorted(required)}, got {sorted(conditioning)}"
+                )
+            context = [conditioning["text_context"].to(self.device)]
+            context_null = [conditioning["negative_context"].to(self.device)]
+            if not self.online_clip_conditioning:
+                raise RuntimeError(
+                    "T5-only conditioning requires online CLIP conditioning"
+                )
+            clip_context = self._encode_online_clip_and_offload(img)
+        else:
+            if self.text_encoder is None or self.clip is None:
+                raise ValueError(
+                    "This pipeline was created for precomputed conditioning, "
+                    "but no conditioning tensors were provided"
+                )
+            if not self.t5_cpu:
+                self.text_encoder.model.to(self.device)
+                context = self.text_encoder([input_prompt], self.device)
+                context_null = self.text_encoder([n_prompt], self.device)
+                if offload_model:
+                    self.text_encoder.model.cpu()
+            else:
+                context = self.text_encoder([input_prompt], torch.device('cpu'))
+                context_null = self.text_encoder([n_prompt], torch.device('cpu'))
+                context = [t.to(self.device) for t in context]
+                context_null = [t.to(self.device) for t in context_null]
+
+            self.clip.model.to(self.device)
+            clip_context = self.clip.visual([img[:, None, :, :]])
+            if offload_model:
+                self.clip.model.cpu()
+
+        _log_memory_stage(
+            self.device, self.rank, "conditioning_ready", "snapshot"
+        )
+
         _log_memory_stage(
             self.device, self.rank, "reference_encode", "begin", reset_peak=True
         )
@@ -1212,10 +1316,6 @@ class SCAIL2Pipeline:
         _log_memory_stage(
             self.device, self.rank, "reference_encode", "end"
         )
-        self._switch_vae_device(
-            to_cuda=False,
-            reason="reference_encode_complete",
-        )
         lat_c = ref_latent.shape[0]
 
         # TODO: support sequence_parallel
@@ -1227,68 +1327,6 @@ class SCAIL2Pipeline:
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
-
-        if n_prompt is None:
-            n_prompt = ""
-
-        if conditioning is not None:
-            required = {"text_context", "negative_context", "clip_context"}
-            if set(conditioning) != required:
-                raise ValueError(
-                    "Precomputed conditioning keys mismatch: "
-                    f"expected {sorted(required)}, got {sorted(conditioning)}"
-                )
-            context = [conditioning["text_context"].to(self.device)]
-            context_null = [conditioning["negative_context"].to(self.device)]
-            if self.online_clip_conditioning:
-                clip_context = self._encode_online_clip_and_offload(img)
-                online_clip_cpu = clip_context.detach().cpu()
-                cached_clip_cpu = conditioning["clip_context"]
-                clip_equal = torch.equal(online_clip_cpu, cached_clip_cpu)
-                max_abs_diff = (
-                    0.0
-                    if clip_equal
-                    else float(
-                        (online_clip_cpu.float() - cached_clip_cpu.float())
-                        .abs()
-                        .max()
-                        .item()
-                    )
-                )
-                logging.info(
-                    "SCAIL2_CLIP_COMPARE equal=%s max_abs_diff=%.9g",
-                    clip_equal,
-                    max_abs_diff,
-                )
-                del online_clip_cpu
-            else:
-                clip_context = conditioning["clip_context"].to(self.device)
-        else:
-            if self.text_encoder is None or self.clip is None:
-                raise ValueError(
-                    "This pipeline was created for precomputed conditioning, "
-                    "but no conditioning tensors were provided"
-                )
-            if not self.t5_cpu:
-                self.text_encoder.model.to(self.device)
-                context = self.text_encoder([input_prompt], self.device)
-                context_null = self.text_encoder([n_prompt], self.device)
-                if offload_model:
-                    self.text_encoder.model.cpu()
-            else:
-                context = self.text_encoder([input_prompt], torch.device('cpu'))
-                context_null = self.text_encoder([n_prompt], torch.device('cpu'))
-                context = [t.to(self.device) for t in context]
-                context_null = [t.to(self.device) for t in context_null]
-
-            self.clip.model.to(self.device)
-            clip_context = self.clip.visual([img[:, None, :, :]])
-            if offload_model:
-                self.clip.model.cpu()
-
-        _log_memory_stage(
-            self.device, self.rank, "conditioning_ready", "snapshot"
-        )
 
         @contextmanager
         def noop_no_sync():
@@ -1832,10 +1870,6 @@ class SCAIL2Pipeline:
                     torch.cuda.synchronize()
                     torch.cuda.empty_cache()
 
-                self._switch_vae_device(
-                    to_cuda=False,
-                    reason=f"segment_{profile_segment}_vae_complete",
-                )
                 if self.vae_dit_offload_blocks:
                     self._switch_vae_dit_blocks(to_cuda=True)
 

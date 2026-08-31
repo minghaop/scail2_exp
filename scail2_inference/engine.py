@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import gc
 import logging
 import os
@@ -288,6 +289,8 @@ class Scail2InferenceEngine:
             "complete",
             elapsed_seconds=time.monotonic() - barrier_started,
         )
+        if hasattr(self.pipeline, "assert_ready_residency"):
+            self.pipeline.assert_ready_residency()
         self.state = EngineState.READY
         self._emit_initialization_event(
             "warmup",
@@ -300,6 +303,15 @@ class Scail2InferenceEngine:
         import torch
 
         torch.cuda.synchronize(self.local_rank)
+
+    @staticmethod
+    def _trim_process_heap() -> None:
+        """Return freed large CPU work buffers to the OS on glibc systems."""
+        try:
+            trimmed = int(ctypes.CDLL(None).malloc_trim(0))
+            logging.info("SCAIL2_CPU_HEAP action=trim result=%d", trimmed)
+        except (AttributeError, OSError, TypeError, ValueError) as error:
+            logging.warning("SCAIL2_CPU_HEAP action=trim status=unavailable error=%s", error)
 
     def _normalize_job(
         self, job: InferenceJob
@@ -357,13 +369,8 @@ class Scail2InferenceEngine:
             reference_mask=job.reference_mask.resolve(strict=True),
             driving_video=job.driving_video.resolve(strict=True),
             driving_mask=job.driving_mask.resolve(strict=True),
-            prompt=job.prompt.strip(),
+            t5_cache_path=job.t5_cache_path.resolve(strict=True),
             output_path=job.output_path.resolve(),
-            conditioning_path=(
-                None
-                if job.conditioning_path is None
-                else job.conditioning_path.resolve(strict=True)
-            ),
             output_fps_fraction=fps_fraction,
             expected_output_frames=frames,
             expected_output_duration=duration,
@@ -397,45 +404,34 @@ class Scail2InferenceEngine:
 
         conditioning = None
         if self.config.precomputed_conditioning:
-            if job.conditioning_path is None:
-                raise InputValidationError(
-                    f"Job {job.job_id} requires a conditioning artifact"
-                )
-            from .conditioning import expected_metadata, load_conditioning
+            from .conditioning import expected_t5_metadata, load_t5_cache
 
             conditioning_started = time.monotonic()
             t5_checkpoint = self.config.checkpoint_dir / self._cfg.t5_checkpoint
-            clip_checkpoint = self.config.checkpoint_dir / self._cfg.clip_checkpoint
-            expected = expected_metadata(
-                prompt=job.prompt,
-                negative_prompt="",
-                reference_image=job.reference_image,
-                target_width=self.config.profile.target_width,
-                target_height=self.config.profile.target_height,
+            expected = expected_t5_metadata(
+                profile=self.config.profile.name,
+                text_len=self._cfg.text_len,
                 t5_checkpoint=t5_checkpoint,
-                clip_checkpoint=clip_checkpoint,
             )
             try:
-                conditioning = load_conditioning(job.conditioning_path, expected)
+                conditioning = load_t5_cache(job.t5_cache_path, expected)
             except Exception as error:
                 raise InputValidationError(
-                    f"Job {job.job_id} conditioning validation failed: {error}"
+                    f"Job {job.job_id} T5 cache validation failed: {error}"
                 ) from error
             logging.info(
-                "SCAIL2_CONDITIONING job_id=%s status=loaded path=%s "
-                "elapsed_seconds=%.3f text_shape=%s negative_shape=%s "
-                "clip_shape=%s",
+                "SCAIL2_T5_CACHE job_id=%s status=loaded path=%s "
+                "elapsed_seconds=%.3f text_shape=%s negative_shape=%s",
                 job.job_id,
-                job.conditioning_path,
+                job.t5_cache_path,
                 time.monotonic() - conditioning_started,
                 tuple(conditioning["text_context"].shape),
                 tuple(conditioning["negative_context"].shape),
-                tuple(conditioning["clip_context"].shape),
             )
-        elif job.conditioning_path is not None:
+        else:
             raise InputValidationError(
-                f"Job {job.job_id} supplied conditioning_path, but the engine "
-                "was not configured for precomputed conditioning"
+                "The file-based inference interface requires an engine configured "
+                "for precomputed T5 conditioning"
             )
 
         profile = self.config.profile
@@ -453,14 +449,14 @@ class Scail2InferenceEngine:
             save_file=str(temp_output),
             save_dir=str(job.output_path.parent),
             ring_size=1,
-            prompt=job.prompt,
+            prompt="",
             diagnostic_memory_probe=diagnostic_memory_probe,
             diagnostic_memory_probe_steps=diagnostic_memory_probe_steps,
             diagnostic_segment_limit=diagnostic_segment_limit,
         )
         generate_video(
             self.pipeline,
-            job.prompt,
+            "",
             str(job.reference_image),
             str(job.reference_mask),
             str(job.driving_video),
@@ -490,6 +486,7 @@ class Scail2InferenceEngine:
         temp_output: Path | None = None
         generation_output: Path | None = None
         audio_output: Path | None = None
+        residency_mutated = False
         try:
             normalized_job, _ = self._normalize_job(job)
             profile = self.config.profile
@@ -542,6 +539,9 @@ class Scail2InferenceEngine:
                     f"Job {normalized_job.job_id} output preparation failed: {message}"
                 )
             if action == "run":
+                if hasattr(self.pipeline, "assert_ready_residency"):
+                    self.pipeline.assert_ready_residency()
+                residency_mutated = True
                 if self.is_primary:
                     temp_output = output_path.with_name(
                         f".{output_path.stem}.inprogress-{os.getpid()}.mp4"
@@ -665,6 +665,13 @@ class Scail2InferenceEngine:
                         f"{publish_error}"
                     )
                 self._barrier()
+                if hasattr(self.pipeline, "restore_ready_residency"):
+                    self.pipeline.restore_ready_residency(
+                        reason=f"job_{normalized_job.job_id}_complete"
+                    )
+                if hasattr(self.pipeline, "assert_ready_residency"):
+                    self.pipeline.assert_ready_residency()
+                residency_mutated = False
 
             result_message = None
             if self.is_primary:
@@ -709,6 +716,20 @@ class Scail2InferenceEngine:
             return InferenceResult.from_dict(result_payload)
         except (InputValidationError, OutputValidationError, FileExistsError):
             # Contract failures do not invalidate resident model parameters.
+            if residency_mutated:
+                try:
+                    if hasattr(self.pipeline, "restore_ready_residency"):
+                        self.pipeline.restore_ready_residency(
+                            reason="contract_failure_recovery"
+                        )
+                    if hasattr(self.pipeline, "assert_ready_residency"):
+                        self.pipeline.assert_ready_residency()
+                except Exception as recovery_error:
+                    self.state = EngineState.ERROR
+                    raise EngineStateError(
+                        "Could not restore READY model residency after a contract "
+                        "failure"
+                    ) from recovery_error
             self.state = EngineState.READY
             raise
         except Exception:
@@ -729,6 +750,7 @@ class Scail2InferenceEngine:
                                 error,
                             )
             gc.collect()
+            self._trim_process_heap()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             self._lock.release()
