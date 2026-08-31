@@ -301,6 +301,7 @@ class SCAIL2Pipeline:
         vae_dit_offload_blocks=0,
         t5_meta_load=False,
         precomputed_conditioning=False,
+        online_clip_conditioning=False,
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -343,8 +344,13 @@ class SCAIL2Pipeline:
                 Build T5 on the meta device and directly assign an mmap-backed
                 weights-only checkpoint before FSDP wrapping.
             precomputed_conditioning (`bool`, *optional*, defaults to False):
-                Skip T5 and CLIP construction. Every generation call must then
-                provide validated precomputed text and visual conditioning.
+                Skip T5 construction and normally skip CLIP construction. Every
+                generation call must provide validated cached conditioning;
+                online_clip_conditioning may replace its visual component.
+            online_clip_conditioning (`bool`, *optional*, defaults to False):
+                With precomputed conditioning, retain cached T5 outputs but
+                recompute the visual context on CUDA for each reference image.
+                CLIP is kept on CPU outside this short encoding phase.
         """
         self.device = torch.device(f"cuda:{device_id}")
         self.config = config
@@ -374,9 +380,14 @@ class SCAIL2Pipeline:
         self.dit_cpu_state_dict_bytes = 0
         self.t5_meta_load = bool(t5_meta_load)
         self.precomputed_conditioning = bool(precomputed_conditioning)
+        self.online_clip_conditioning = bool(online_clip_conditioning)
         if self.precomputed_conditioning and t5_fsdp:
             raise ValueError(
                 "precomputed_conditioning requires t5_fsdp=False"
+            )
+        if self.online_clip_conditioning and not self.precomputed_conditioning:
+            raise ValueError(
+                "online_clip_conditioning requires precomputed_conditioning=True"
             )
         if self.dit_resident_dtype == torch.bfloat16 and self.lora_path is not None:
             raise ValueError(
@@ -477,7 +488,7 @@ class SCAIL2Pipeline:
         )
 
         self.clip = None
-        if self.precomputed_conditioning:
+        if self.precomputed_conditioning and not self.online_clip_conditioning:
             _emit_pipeline_init_event(
                 self.rank,
                 "clip_load",
@@ -498,7 +509,11 @@ class SCAIL2Pipeline:
             )
             self.clip = CLIPModel(
                 dtype=config.clip_dtype,
-                device=self.device,
+                device=(
+                    torch.device("cpu")
+                    if self.online_clip_conditioning
+                    else self.device
+                ),
                 checkpoint_path=clip_checkpoint_path,
                 tokenizer_path=os.path.join(checkpoint_dir, config.clip_tokenizer))
             _emit_pipeline_init_event(
@@ -506,6 +521,9 @@ class SCAIL2Pipeline:
                 "clip_load",
                 "complete",
                 started_at=clip_started,
+                resident_device=(
+                    "cpu" if self.online_clip_conditioning else str(self.device)
+                ),
             )
 
         logging.info(
@@ -868,6 +886,47 @@ class SCAIL2Pipeline:
             (total - free) / 2**20,
         )
 
+    def _encode_online_clip_and_offload(self, img):
+        if not self.online_clip_conditioning or self.clip is None:
+            raise RuntimeError("Online CLIP conditioning is unavailable")
+        if any(parameter.is_cuda for parameter in self.clip.model.parameters()):
+            raise RuntimeError("CLIP must be CPU-resident before reference encoding")
+
+        torch.cuda.synchronize(self.device)
+        torch.cuda.reset_peak_memory_stats(self.device)
+        started = time.monotonic()
+        before_allocated = torch.cuda.memory_allocated(self.device)
+        logging.info(
+            "SCAIL2_CLIP_PHASE action=encode_start "
+            "allocated_before_mib=%.1f",
+            before_allocated / 2**20,
+        )
+        clip_context = None
+        try:
+            self.clip.model.to(self.device)
+            clip_context = self.clip.visual([img[:, None, :, :]])
+            torch.cuda.synchronize(self.device)
+            peak_allocated = torch.cuda.max_memory_allocated(self.device)
+        finally:
+            self.clip.model.cpu()
+            gc.collect()
+            torch.cuda.synchronize(self.device)
+            torch.cuda.empty_cache()
+
+        after_allocated = torch.cuda.memory_allocated(self.device)
+        free, total = torch.cuda.mem_get_info(self.device)
+        logging.info(
+            "SCAIL2_CLIP_PHASE action=encode_complete elapsed_seconds=%.3f "
+            "peak_allocated_mib=%.1f allocated_after_mib=%.1f "
+            "device_used_after_mib=%.1f context_shape=%s",
+            time.monotonic() - started,
+            peak_allocated / 2**20,
+            after_allocated / 2**20,
+            (total - free) / 2**20,
+            tuple(clip_context.shape),
+        )
+        return clip_context
+
     def fuse_lora(self, lora_path, alpha=1.0):
         logging.info(f"Fusing LoRA from {lora_path}, strength = {alpha}.")
         lora_state_dict = load_file(lora_path)
@@ -1104,7 +1163,29 @@ class SCAIL2Pipeline:
                 )
             context = [conditioning["text_context"].to(self.device)]
             context_null = [conditioning["negative_context"].to(self.device)]
-            clip_context = conditioning["clip_context"].to(self.device)
+            if self.online_clip_conditioning:
+                clip_context = self._encode_online_clip_and_offload(img)
+                online_clip_cpu = clip_context.detach().cpu()
+                cached_clip_cpu = conditioning["clip_context"]
+                clip_equal = torch.equal(online_clip_cpu, cached_clip_cpu)
+                max_abs_diff = (
+                    0.0
+                    if clip_equal
+                    else float(
+                        (online_clip_cpu.float() - cached_clip_cpu.float())
+                        .abs()
+                        .max()
+                        .item()
+                    )
+                )
+                logging.info(
+                    "SCAIL2_CLIP_COMPARE equal=%s max_abs_diff=%.9g",
+                    clip_equal,
+                    max_abs_diff,
+                )
+                del online_clip_cpu
+            else:
+                clip_context = conditioning["clip_context"].to(self.device)
         else:
             if self.text_encoder is None or self.clip is None:
                 raise ValueError(

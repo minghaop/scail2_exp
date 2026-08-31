@@ -253,6 +253,7 @@ class Scail2InferenceEngine:
             vae_dit_offload_blocks=self.config.vae_dit_offload_blocks,
             t5_meta_load=self.config.t5_meta_load,
             precomputed_conditioning=self.config.precomputed_conditioning,
+            online_clip_conditioning=self.config.online_clip_conditioning,
         )
         return pipeline, cfg, identity
 

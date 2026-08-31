@@ -523,3 +523,14 @@ wan/distributed/fsdp.py，以及 experiment_logs 下的两份日志。
 - 完整输出 `experiment_outputs/single_gpu/101-20260828-183620.mp4` 已由引擎和 ffprobe 验证：H.264、512x896、30 fps、297 帧、9.9 秒、19406099 bytes，SHA-256=`fa56145b030db5f6659be2449ff68fe67850344f52801c97762a677c19c71e70`。与双卡 FSDP 视频逐帧比较为 average PSNR=30.640 dB、SSIM=0.935252；两者并非字节一致，这与先前已记录的 FSDP/非 FSDP 首步微小数值差异一致。
 - 完整任务 NVML 峰值为 40075/40960 MiB，仍发生在 DiT；独立 VAE probe 已确认 7-block offload 后 VAE 峰值为 38470.8 MiB。任务结束时 CPU master 和完整 CUDA model 均为 31272.0 MiB，进程正常退出后 GPU 2 回到 0 MiB/0%，volatile uncorrectable ECC=0。按单请求几乎相同的延迟计算，两个独立单卡 worker 可用与一个双卡 FSDP worker 相同的两张 GPU 同时处理两个请求，单位 GPU 吞吐接近翻倍。
 - 上述 `183620` 完整单卡实验为了隔离模型阶段曾使用 `output_audio_mode=none`，因此其整个 MP4 哈希不能直接与含 AAC 音频的双卡输出比较。后续已将正式 `--full-inference` 模式恢复为 `output_audio_mode=driving`；init/memory/单 segment probe 仍保持无音频。dry-run 已确认单卡 full inference 和双卡正式路径均为 driving audio。
+
+## 34. 单卡在线 CLIP 编码与阶段 offload（2026-08-28）
+
+- 单卡路径新增 `online_clip_conditioning`：T5 正向/负向 context 继续读取 conditioning cache，CLIP visual encoder 改为 CPU 常驻；每个任务完成 reference VAE 处理后，CLIP 短暂上 GPU 生成 visual context，随后立即回 CPU并执行 CUDA cache 清理。双卡和生产配置默认关闭该开关，现有路径不变。
+- 当前仍读取原 v1 conditioning artifact 中的缓存 `clip_context`，但它只用于逐元素校验，不作为本次 DiT 输入。这样无需先迁移缓存 schema，即可确认在线 CLIP 与离线预处理结果是否一致。
+- 首步日志为 `experiment_logs/single_gpu/101-20260828-191658.log`。冷态 CLIP CPU checkpoint 加载 8.070 秒，engine load 为 19.849 秒；ready 设备占用仍为 32266.8 MiB，证明 CLIP 初始化没有留下 CUDA 权重。在线编码/offload 耗时 2.721 秒，combined allocated 峰值为 33024.8 MiB；offload 后 allocated=31811.7 MiB、device used=32352.8 MiB。
+- 在线和缓存 CLIP context 均为 `[1,257,1280]` FP16，逐元素 `torch.equal=True`、最大绝对差为 0。首步 latent SHA-256 仍为 `26517d3bf0dd1313f0302ddc2e77ac2e71dd8613c9ca5f5384057faae9764eb3`，与此前纯缓存单卡首步完全一致。任务 exit code 0，NVML 峰值为 40061/40960 MiB，仍发生在 DiT。
+- 正式完整回归日志为 `experiment_logs/single_gpu/101-20260828-191836.log`，输出为 `experiment_outputs/single_gpu/101-20260828-191836.mp4`。热态 CLIP CPU 加载 4.551 秒，engine load 16.379 秒；在线编码/offload 1.331 秒，阶段 NVML 峰值 34555 MiB。4 个 segment、24 个 diffusion step、4 次 VAE decode、3 次 history encode 和 4 次 7-block offload/reload 全部成功。
+- 完整请求 started-to-finished 为 429.555 秒，其中 driving audio mux 为 2.599 秒；此前无在线 CLIP且无音频的单卡请求为 425.044 秒。与含音频的双卡 FSDP 对照 424.714 秒相比，新单卡路径慢 4.841 秒（1.14%），仍只使用一张 GPU。
+- 新输出为 H.264 512x896、30 fps、297 帧、9.9 秒，并包含 AAC 9.9 秒音频；文件大小 19652849 bytes，SHA-256=`fcb0871b57305440b8cd33ab8e3960a7d8f81f68c401190addda80ac59137d7e`。视频 elementary stream SHA-256 与旧单卡输出均为 `d873574d3209902804225f21d427b987aab383c80372ca681641ff5adf4fc7a9`；音频 stream SHA-256 与双卡 driving audio 均为 `dce6c3e3d3db3750c5aebabb8cdfc346bcfa050fbeffde966dfb699629236340`。
+- 完整任务 NVML 峰值为 40081/40960 MiB，仍由 DiT 决定，剩余约 879 MiB。任务结束后 GPU 正常释放。结论是 CLIP 可以安全回到单卡主流程，但必须只在 reference 阶段短暂驻留 GPU；它增加约 1.3 秒热态请求开销和约 1.2 GiB CPU RSS，不改变视频结果或后续 DiT/VAE 阶段行为。

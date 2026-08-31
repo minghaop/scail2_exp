@@ -10,10 +10,11 @@ SCAIL2 已完成从双卡 FSDP 到单卡推理的实验性改造，并在一张 
 
 - DiT 执行 diffusion 时，40 个 block 的 BF16 权重全部位于 GPU，不在 block 间做 CPU offload。
 - VAE decode 和 history encode 前，临时卸载末尾 7 个 DiT block；阶段结束后再从 CPU master 恢复完整 DiT。
+- T5 context 继续使用缓存；CLIP 在 reference 阶段短暂上 GPU，生成 visual context 后立即回 CPU。
 
-完整单卡推理耗时 425.044 秒，双卡 FSDP 对照为 424.714 秒。两者单请求延迟基本相同，但单卡方案只使用一张 GPU，因此在两张相同 GPU 上运行两个独立单卡 worker 时，理论并发吞吐接近双卡 worker 的两倍。
+最新完整单卡推理包含在线 CLIP 和 driving audio，耗时 429.555 秒；双卡 FSDP 对照为 424.714 秒。单卡慢 1.14%，但只使用一张 GPU，因此在两张相同 GPU 上运行两个独立单卡 worker 时，理论并发吞吐仍接近双卡 worker 的两倍。
 
-单卡方案目前最大的限制是 DiT 峰值达到 40075/40960 MiB，只剩约 885 MiB 物理余量。它已经可运行，但不适合在完整 DiT 常驻时继续叠加 CLIP、VAE 或其他较大的 CUDA buffer。
+单卡方案目前最大的限制是 DiT 峰值达到 40081/40960 MiB，只剩约 879 MiB 物理余量。CLIP reference 阶段可以短暂叠加，但在 diffusion 峰值期间不能再增加较大的 CUDA 常驻 buffer。
 
 ## 2. 实验目标与条件
 
@@ -28,7 +29,7 @@ SCAIL2 已完成从双卡 FSDP 到单卡推理的实验性改造，并在一张 
 | Segment | 81、81、81、57 帧 |
 | Diffusion | 每段 6 步，共 24 步 |
 | DiT | BF16，40 个 block，全量单卡运行 |
-| Conditioning | 预计算缓存，主流程不加载 T5/CLIP |
+| Conditioning | T5 使用预计算缓存；CLIP 在线编码后 offload |
 | FFN/RoPE 分块 | 8192 / 8192 |
 | CUDA allocator | `expandable_segments:True` |
 | 单卡入口 | `run_single_gpu_experiment.py` |
@@ -42,7 +43,11 @@ CPU 内存中始终保留一份完整 DiT checkpoint tensor，约 31272 MiB。�
 ```text
 初始化
   CPU master：完整 40-block DiT
+  CPU：CLIP visual encoder
   GPU：完整 40-block DiT
+             │
+             ▼
+Reference：CLIP 短暂上 GPU生成 context，随后回 CPU
              │
              ▼
 DiT diffusion：40 个 block 全部在 GPU 执行
@@ -79,7 +84,9 @@ VAE decode + history encode
 | 阶段 | GPU 上的 DiT | allocated | reserved | device/NVML used | 物理余量 |
 |---|---|---:|---:|---:|---:|
 | Engine ready | 40 blocks | 31756.1 | 31768.0 | 32266.8 | 8693.2 |
-| 81 帧 DiT 峰值 | 40 blocks | 最高可见 37592.7 | 约 38494 | **40075** | **885** |
+| CLIP reference 峰值 | 40 blocks + CLIP | 33024.8 | — | 34555 | 6405 |
+| CLIP offload 后 | 40 blocks | 31811.7 | — | 32352.8 | 8607.2 |
+| 81 帧 DiT 峰值 | 40 blocks | 首步可见 37592.7 | 约 38574 | **40081** | **879** |
 | Segment cleanup 后 | 40 blocks | 31828.9 | — | 约 32389 | 约 8571 |
 | 卸载 7 blocks 后 | 33 blocks | 26437.1 | 26510.0 | 27028.8 | 13931.2 |
 | VAE decode 峰值 | 33 blocks | 35399.9 | 37952.0 | **38470.8** | **2489.2** |
@@ -98,6 +105,8 @@ CPU 侧同时保留约 31272 MiB 的 DiT master。若以后每张 GPU 启动一�
 | 首 segment 全 6 步 | `experiment_logs/single_gpu/101-20260828-181018.log` | 无 DiT offload，6/6 步成功；耗时 100.2 秒，峰值 40073 MiB |
 | 单 segment + VAE 切换 | `experiment_logs/single_gpu/101-20260828-182908.log` | offload、VAE、reload 和输出全部成功；峰值 40033 MiB |
 | 完整 4 segments | `experiment_logs/single_gpu/101-20260828-183620.log` | 24 步、4 次 VAE、3 次 history encode、4 次 reload 全部成功 |
+| 在线 CLIP 首步 | `experiment_logs/single_gpu/101-20260828-191658.log` | CLIP context 与缓存完全一致；offload 后首步 latent hash 不变 |
+| 在线 CLIP 完整回归 | `experiment_logs/single_gpu/101-20260828-191836.log` | 297 帧和 driving audio 全部成功；视频码流与原单卡输出一致 |
 
 完整回归证明阶段切换不是只能执行一次：第二至第四个 segment 均在 reload 后继续完成 DiT，CPU master 和恢复后的 CUDA DiT 大小也保持一致。
 
@@ -109,16 +118,16 @@ CPU 侧同时保留约 31272 MiB 的 DiT master。若以后每张 GPU 启动一�
 |---|---:|---:|---:|
 | 81 帧 DiT | 16.70 秒/步 | 16.91--16.99 秒/步 | 单卡略快 |
 | 57 帧 DiT | 10.31 秒/步 | 10.49--10.53 秒/步 | 单卡略快 |
-| DiT block offload | 合计 0.551 秒 | 不适用 | 单卡新增 |
-| DiT block reload | 合计 4.807 秒 | 不适用 | 单卡新增 |
-| 阶段切换总成本 | 5.358 秒 | 不适用 | 单卡新增 |
-| 生成主流程 | 406.104 秒 | 402.992 秒 | 单卡慢 3.112 秒（0.77%） |
-| 请求总时间 | 425.044 秒 | 424.714 秒 | 单卡慢 0.330 秒（0.078%） |
+| 在线 CLIP | 1.331 秒 | 使用缓存 | 单卡新增 |
+| DiT block offload | 合计 0.586 秒 | 不适用 | 单卡新增 |
+| DiT block reload | 合计 5.465 秒 | 不适用 | 单卡新增 |
+| Audio mux | 2.599 秒 | 2.431 秒 | 单卡慢 0.168 秒 |
+| 当前请求总时间 | 429.555 秒 | 424.714 秒 | 单卡慢 4.841 秒（1.14%） |
 | 使用 GPU 数 | 1 | 2 | 单卡节省 1 张 GPU |
 
-总时间对比存在一个媒体路径差异：这次历史单卡回归关闭了音频，而双卡结果包含约 2.431 秒的音频 mux。因此“请求总时间”只能说明两者处于同一量级；更公平的模型主流程对比是单卡慢约 0.77%。
+此前不执行在线 CLIP且关闭音频的历史单卡回归为 425.044 秒，不能直接与含音频的双卡结果比较；它的生成主流程比双卡慢约 0.77%。
 
-当前代码已把正式 `--full-inference` 恢复为 driving audio，其他 probe 仍不输出音频。恢复音频后的完整单卡路径已通过 dry-run 配置检查，但尚未重新执行一次 297 帧正式回归。
+当前正式 `--full-inference` 使用 driving audio，其他 probe 仍不输出音频。带在线 CLIP 和 driving audio 的完整回归为 429.555 秒；双卡 FSDP 含音频对照为 424.714 秒，单卡慢 4.841 秒（1.14%）。其中在线 CLIP 热态编码/offload 为 1.331 秒，音频 mux 为 2.599 秒。
 
 ## 8. 输出结果与数值差异
 
@@ -146,6 +155,8 @@ fa56145b030db5f6659be2449ff68fe67850344f52801c97762a677c19c71e70
 
 目前尚未做“相同单卡执行拓扑，仅切换 offload 开/关”的中间 latent 对照，因此还不能单独量化阶段切换是否在后续 segment 引入额外数值差异。
 
+在线 CLIP 完整回归输出为 `experiment_outputs/single_gpu/101-20260828-191836.mp4`。它包含 H.264 297 帧和 AAC 9.9 秒音频；视频 elementary stream 与上述历史单卡输出完全一致，音频 stream 与双卡 driving audio 完全一致。因此重新执行 CLIP 没有改变单卡视频结果。
+
 ## 9. 使用方式
 
 完整单卡推理：
@@ -167,10 +178,10 @@ python run_single_gpu_experiment.py --vae-offload-probe
 
 ## 10. 当前限制与下一步
 
-1. DiT 阶段只剩约 885 MiB 物理余量，新增 CUDA 常驻对象前必须重新测峰值。
-2. 正式 driving audio 配置需要再跑一次完整单卡回归，补齐最终耗时与带音频输出验证。
-3. 需要做同一单卡拓扑下 offload 开/关的 latent hash 对照，隔离权重阶段切换本身的数值影响。
-4. 后续恢复 CLIP 时，应在 DiT 前执行并在使用结束后完全 offload，不能与完整 CUDA DiT 长期共存。
+1. DiT 阶段只剩约 879 MiB 物理余量，新增 CUDA 常驻对象前必须重新测峰值。
+2. 需要做同一单卡拓扑下 offload 开/关的 latent hash 对照，隔离权重阶段切换本身的数值影响。
+3. 在线 CLIP 已验证可行，但使每个 worker 的 CPU RSS 增加约 1.2 GiB，并增加 checkpoint 加载时间；多 worker 时需要计入主存和启动 I/O。
+4. 当前缓存仍包含仅用于校验的 `clip_context`；稳定后可将缓存 schema 拆成纯 T5 context，避免语义冗余。
 5. 若目标扩展为多单卡 worker，应同时评估每个 worker 约 31.27 GiB 的 CPU master 和模型文件 I/O 对主存及启动并发的影响。
 
 ## 11. 相关文件

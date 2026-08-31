@@ -81,6 +81,11 @@ python -u run_fsdp_experiment.py \
 - `self.clip=None`，不构造或加载 CLIP。
 - 只读取约 1.42 MB 的 cache，并将三个 tensor 移动到当前 GPU。
 
+上述行为仍是默认路径。单卡实验后续增加了可选
+`online_clip_conditioning=True`：继续读取缓存中的 T5 context，但重新执行
+CLIP reference encode，并在生成 visual context 后把 CLIP offload 回 CPU。缓存中的
+`clip_context` 当前只用于结果一致性校验；双卡路径不启用该开关。
+
 代码仍会导入 T5/CLIP Python 模块，并读取 checkpoint 的 stat 信息做身份校验，但不会读取 checkpoint tensor payload。
 
 缓存不会仅因文件存在而自动启用。如果不传 `--conditioning-cache`，主流程仍会加载 T5 和 CLIP。

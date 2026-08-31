@@ -54,6 +54,14 @@
 
 本次历史单卡输出没有音频，正式单卡模式随后已恢复 driving audio。单卡与双卡解码后视频的平均 PSNR 为 30.640 dB，SSIM 为 0.935252。首个 diffusion step 在 VAE 权重切换前已经出现微小数值差异，因此差异主要与普通单卡参数路径和 FSDP 数值路径不同有关。
 
+## CLIP 恢复到单卡流程
+
+在完整单卡方案跑通后，将 CLIP visual encoder 恢复到主流程。T5 继续使用缓存；CLIP 平时保留在 CPU，只在 reference 阶段短暂移到 GPU，生成 visual context 后立即 offload。
+
+首步实验确认在线 CLIP context 与缓存逐元素完全一致，offload 后首步 latent hash 也保持不变。完整 297 帧回归随后成功，包含 driving audio；视频码流与原单卡输出完全一致，音频码流与双卡 driving audio 完全一致。
+
+在线 CLIP 热态执行约增加 1.3 秒，请求总时间为 429.555 秒，比含音频的双卡 FSDP 对照慢约 1.14%。完整任务峰值仍由 DiT 决定，为 40081 MiB。
+
 ## 相关记录
 
 - `SCAIL2_DIT_MEMORY_OPTIMIZATION_REPORT.md`

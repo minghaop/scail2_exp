@@ -115,6 +115,7 @@ class EngineConfig:
     keep_dit_cpu_state_dict: bool = False
     vae_dit_offload_blocks: int = 0
     precomputed_conditioning: bool = False
+    online_clip_conditioning: bool = False
     t5_cpu: bool = False
     offload_model: bool = False
     output_audio_mode: str = "none"
@@ -132,6 +133,10 @@ class EngineConfig:
         if self.precomputed_conditioning and self.t5_fsdp:
             raise EnvironmentValidationError(
                 "precomputed_conditioning requires t5_fsdp=False"
+            )
+        if self.online_clip_conditioning and not self.precomputed_conditioning:
+            raise EnvironmentValidationError(
+                "online_clip_conditioning requires precomputed_conditioning=True"
             )
         if self.offload_model:
             raise EnvironmentValidationError(

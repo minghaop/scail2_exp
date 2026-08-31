@@ -162,7 +162,8 @@ def launch_worker(payload: dict[str, object]) -> None:
         f"Log file: {log_path}\n"
         f"Launching single-GPU experiment on physical GPU {physical_gpu}\n"
         "World size: 1; process group: disabled; FSDP: disabled\n"
-        "T5/CLIP: precomputed; DiT: full BF16 CUDA resident + CPU master\n"
+        "T5: precomputed; CLIP: online CUDA encode then CPU offload; "
+        "DiT: full BF16 CUDA resident + CPU master\n"
         "Mode: "
         + (
             "init-only"
@@ -300,6 +301,7 @@ def run_worker(args: argparse.Namespace, payload: dict[str, object]) -> None:
             7 if args.vae_offload_probe or args.full_inference else 0
         ),
         precomputed_conditioning=True,
+        online_clip_conditioning=True,
         offload_model=False,
         output_audio_mode=str(payload["output_audio"]),
     )
@@ -402,6 +404,7 @@ def main() -> None:
         printable["world_size"] = 1
         printable["dit_fsdp"] = False
         printable["keep_dit_cpu_state_dict"] = True
+        printable["online_clip_conditioning"] = True
         print(json.dumps(printable, ensure_ascii=False, indent=2, sort_keys=True))
         return
     if args.worker:
