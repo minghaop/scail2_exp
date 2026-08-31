@@ -33,4 +33,4 @@ __all__ = [
     "Scail2InferenceError",
 ]
 
-__version__ = "0.1.3"
+__version__ = "0.1.0"

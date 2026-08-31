@@ -38,7 +38,7 @@ def resolve_job_paths() -> dict[str, Path]:
 
 def validate_media_contract(payload: dict[str, object]) -> None:
     os.environ["PATH"] = f"{CONDA_ENV / 'bin'}:/usr/bin:/bin"
-    from scail2_inference.media import probe_audio, probe_video
+    from scail2_single_gpu_runtime.media import probe_audio, probe_video
 
     video_info = probe_video(Path(payload["driving_video"]))
     mask_info = probe_video(Path(payload["driving_mask"]))

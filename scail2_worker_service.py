@@ -35,8 +35,11 @@ DIT_CHECKPOINT = Path(
 )
 PROFILE_NAME = "scail2-512p-bf16-v1"
 OUTPUT_AUDIO_MODE = "driving"
+T5_PRECACHE_URL = "http://192.168.190.2:8001/v1/t5-cache"
+T5_CACHE_FILENAME = "conditioning.safetensors"
 
 DOWNLOAD_TIMEOUT_SECONDS = 300.0
+T5_PRECACHE_TIMEOUT_SECONDS = 600.0
 UPLOAD_TIMEOUT_SECONDS = 900.0
 INFERENCE_TIMEOUT_SECONDS = 7200.0
 STARTUP_TIMEOUT_SECONDS = 1800.0
@@ -48,9 +51,8 @@ PATH_PARAM_FIELDS = (
     "reference_mask",
     "driving_video",
     "driving_mask",
-    "t5_cache",
 )
-REQUIRED_PARAM_FIELDS = PATH_PARAM_FIELDS
+REQUIRED_PARAM_FIELDS = (*PATH_PARAM_FIELDS, "prompt")
 
 
 def unix_milliseconds() -> int:
@@ -131,6 +133,7 @@ def validate_submission(message: Mapping[str, Any]) -> ValidatedSubmission:
     for field_name in REQUIRED_PARAM_FIELDS:
         if field_name not in params:
             raise SubmissionError(f"params.{field_name} is required")
+    _required_nonempty_string(params["prompt"], "params.prompt")
     for field_name in PATH_PARAM_FIELDS:
         _relative_path(params[field_name], f"params.{field_name}")
 
@@ -230,6 +233,55 @@ def download_inputs(work_dir: Path, downloads: Sequence[DownloadSpec]) -> None:
             raise
         except Exception as error:
             raise _transfer_failure("download", str(download.local_file), error) from error
+
+
+def request_t5_cache(work_dir: Path, prompt: str) -> Path:
+    """Request one validated cache artifact from the fixed T5 precache service."""
+    destination = work_dir / T5_CACHE_FILENAME
+    temporary = destination.with_name(f".{destination.name}.inprogress-{os.getpid()}")
+    payload = json.dumps({"prompt": prompt}, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        T5_PRECACHE_URL,
+        data=payload,
+        headers={
+            "Accept": "application/octet-stream",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+        method="POST",
+    )
+    started = time.monotonic()
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=T5_PRECACHE_TIMEOUT_SECONDS,
+        ) as response:
+            content_type = response.headers.get_content_type()
+            if content_type != "application/octet-stream":
+                raise TransferError(
+                    f"T5 precache returned unexpected content type: {content_type}"
+                )
+            with temporary.open("wb") as output:
+                shutil.copyfileobj(response, output)
+            prompt_hash = response.headers.get("X-SCAIL2-Prompt-SHA256", "unknown")
+            cache_hit = response.headers.get("X-SCAIL2-Cache-Hit", "unknown")
+        if not temporary.is_file() or temporary.stat().st_size == 0:
+            raise TransferError("T5 precache returned an empty artifact")
+        os.replace(temporary, destination)
+        logging.info(
+            "SCAIL2_T5_PRECACHE status=complete prompt_hash=%s cache_hit=%s "
+            "bytes=%d elapsed_seconds=%.3f",
+            prompt_hash,
+            cache_hit,
+            destination.stat().st_size,
+            time.monotonic() - started,
+        )
+        return destination
+    except TransferError:
+        raise
+    except Exception as error:
+        raise _transfer_failure("request T5 cache", destination.name, error) from error
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def upload_output(output_path: Path, upload_url: str) -> None:
@@ -520,7 +572,12 @@ class DispatcherWorkerService:
             await asyncio.to_thread(
                 download_inputs, self._work_dir, submission.downloads
             )
-            job = self._build_job(job_id, submission)
+            t5_cache_path = await asyncio.to_thread(
+                request_t5_cache,
+                self._work_dir,
+                _required_nonempty_string(submission.params["prompt"], "params.prompt"),
+            )
+            job = self._build_job(job_id, submission, t5_cache_path)
             job.validate(check_paths=True)
             loop = asyncio.get_running_loop()
             record = TaskRecord(
@@ -589,6 +646,7 @@ class DispatcherWorkerService:
         self,
         job_id: str,
         submission: ValidatedSubmission,
+        t5_cache_path: Path,
     ) -> Any:
         params = submission.params
 
@@ -606,7 +664,7 @@ class DispatcherWorkerService:
             reference_mask=reference_mask,
             driving_video=local_path("driving_video"),
             driving_mask=local_path("driving_mask"),
-            t5_cache_path=local_path("t5_cache"),
+            t5_cache_path=t5_cache_path,
             output_path=self._work_dir / f"{job_id}.mp4",
             overwrite=False,
             metadata={"source": "dispatcher", "handle": submission.handle},
@@ -811,7 +869,7 @@ def main() -> None:
 
     try:
         import uvicorn
-        from scail2_inference import (
+        from scail2_single_gpu_runtime import (
             EngineConfig,
             InferenceJob,
             ProductionProfile,
@@ -821,7 +879,7 @@ def main() -> None:
         )
     except ImportError as error:
         raise RuntimeError(
-            "Install scail2-inference, fastapi and uvicorn[standard] in the container"
+            "Provide scail2_single_gpu_runtime and install fastapi and uvicorn[standard]"
         ) from error
 
     profile = ProductionProfile.from_name(PROFILE_NAME)

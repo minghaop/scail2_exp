@@ -13,16 +13,18 @@
 - driving mask
 - 预先生成并校验过的 T5 cache
 
-prompt 不再进入在线推理接口。使用 `t5_precache_service` HTTP 服务生成 T5
-cache；在线推理仍会用 reference image 计算 CLIP context。服务用法见
-`t5_precache_service/README.zh-CN.md`。
+底层 SDK 不接收 prompt，只接收已经生成的 T5 cache；在线推理仍会用
+reference image 计算 CLIP context。Dispatcher Worker 的外部协议则接收
+`params.prompt` 和四个媒体文件，在提交给 SDK 前固定请求
+`http://192.168.190.2:8001/v1/t5-cache` 生成或读取 cache。调用方不再上传
+T5 cache 文件。T5 服务用法见 `t5_precache_service/README.zh-CN.md`。
 
 ## 生命周期
 
 ```python
 from pathlib import Path
 
-from scail2_inference import (
+from scail2_single_gpu_runtime import (
     EngineConfig,
     InferenceJob,
     ProductionProfile,

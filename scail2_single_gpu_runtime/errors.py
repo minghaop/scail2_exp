@@ -1,4 +1,4 @@
-"""Typed failures exposed by the SCAIL-2 inference SDK."""
+"""Typed failures exposed by the SCAIL-2 single-GPU runtime."""
 
 
 class Scail2InferenceError(RuntimeError):

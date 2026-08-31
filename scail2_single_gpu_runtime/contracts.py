@@ -80,7 +80,7 @@ class ProductionProfile:
         filename = f"{name}.json"
         try:
             profile_text = (
-                resources.files("scail2_inference.profiles")
+                resources.files("scail2_single_gpu_runtime.profiles")
                 .joinpath(filename)
                 .read_text(encoding="utf-8")
             )
@@ -139,7 +139,7 @@ class EngineConfig:
             raise EnvironmentValidationError(
                 f"No packaged architecture config for model {model_name!r}"
             ) from exc
-        resource = resources.files("scail2_inference.model_configs").joinpath(
+        resource = resources.files("scail2_single_gpu_runtime.model_configs").joinpath(
             filename
         )
         path = Path(str(resource))

@@ -193,7 +193,7 @@ python run_single_gpu_experiment.py --vae-offload-probe
 ## 11. 相关文件
 
 - 单卡入口：`run_single_gpu_experiment.py`
-- 推理配置与调用：`scail2_inference/engine.py`
+- 推理配置与调用：`scail2_single_gpu_runtime/engine.py`
 - DiT/VAE 阶段切换：`wan/scail.py`
 - 完整实验流水：`SCAIL2_EXPERIMENT_CONTEXT.md`
 - DiT 显存细节：`SCAIL2_DIT_MEMORY_OPTIMIZATION_REPORT.md`

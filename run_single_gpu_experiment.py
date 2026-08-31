@@ -113,7 +113,12 @@ def launch_worker(args: argparse.Namespace, payload: dict[str, object]) -> None:
 
 
 def run_worker(args: argparse.Namespace, payload: dict[str, object]) -> None:
-    from scail2_inference import EngineConfig, InferenceJob, ProductionProfile, Scail2InferenceEngine
+    from scail2_single_gpu_runtime import (
+        EngineConfig,
+        InferenceJob,
+        ProductionProfile,
+        Scail2InferenceEngine,
+    )
 
     profile = ProductionProfile.from_name(PROFILE_NAME)
     engine = Scail2InferenceEngine(EngineConfig(

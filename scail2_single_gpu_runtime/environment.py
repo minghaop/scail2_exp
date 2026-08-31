@@ -1,4 +1,4 @@
-"""Runtime diagnostics used by Podman health and installation checks."""
+"""Runtime diagnostics used by Podman health and startup checks."""
 
 from __future__ import annotations
 

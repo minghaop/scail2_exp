@@ -31,11 +31,11 @@
 1. `AGENTS.md`（如果服务器仓库中存在）
 2. `INFERENCE_SDK_USAGE.zh-CN.md`
 3. `scail2_worker_service.py`
-4. `scail2_inference/engine.py`
-5. `scail2_inference/runtime.py`
-6. `scail2_inference/contracts.py`
-7. `scail2_inference/profiles/scail2-512p-bf16-v1.json`
-8. `scail2_inference/model_configs/config-14b.json`
+4. `scail2_single_gpu_runtime/engine.py`
+5. `scail2_single_gpu_runtime/runtime.py`
+6. `scail2_single_gpu_runtime/contracts.py`
+7. `scail2_single_gpu_runtime/profiles/scail2-512p-bf16-v1.json`
+8. `scail2_single_gpu_runtime/model_configs/config-14b.json`
 9. `wan/scail.py`
 10. `wan/modules/model_scail2.py`
 11. `wan/modules/t5.py`
@@ -583,4 +583,9 @@ wan/distributed/fsdp.py，以及 experiment_logs 下的两份日志。
 - 单次完整回归日志 `experiment_logs/single_gpu/101-20260831-150319.log`：297 帧、4 个 segment、24 个 diffusion step、音频合并和最终 READY 恢复全部成功。请求耗时 437.891 秒，CUDA allocated 峰值 36819.1 MiB，NVML 峰值 39491/40960 MiB。输出 `101-20260831-150319.mp4` 的 SHA-256 为 `fcb0871b57305440b8cd33ab8e3960a7d8f81f68c401190addda80ac59137d7e`，与当前 FP16 context 标准输出逐字节一致。
 - 同一 engine 连续两次最终回归日志为 `experiment_logs/single_gpu/101-20260831-152730.log`。两次耗时 435.951/430.966 秒，CUDA allocated 峰值均为 36819.1 MiB，输出 SHA-256 均为 `fcb0871b...37d7e`；每次结束后的 allocated 均为 32977.8 MiB，VAE、CLIP、完整 DiT 均恢复 CUDA，证明 GPU 侧无逐请求累积。
 - CPU master 的初始 RSS 分解为 file-backed 31516.6 MiB、anonymous 461.6 MiB，符合 safetensors mmap 设计。为避免视频拼接和模型迁移形成 glibc heap 高水位，请求 finally 中增加 best-effort `malloc_trim(0)`；连续两次结束后的 RSS 为 33094.9/33149.1 MiB，其中 file-backed 均为 31588.4 MiB，anonymous 仅相差约 54 MiB，未再出现未回收版本中每次增加 GiB 级 RSS 的现象。
-- Dispatcher 服务输入契约同步改为五个文件：reference image/mask、driving video/mask 和 T5 cache，不再接收 prompt；单卡生产 `EngineConfig` 默认值和 worker 配置均采用上述驻留/迁移策略。调用仍由 runtime lock 和单任务 Backend 串行化；普通输入/输出契约失败恢复 READY，CUDA/模型异常进入 ERROR 并由外部重启 worker。
+- 底层 `InferenceJob` 仍接收四个媒体文件和 T5 cache；Dispatcher Worker
+  的外部契约后续调整为四个媒体文件加 prompt。Worker 收到 prompt 后固定请求
+  `http://192.168.190.2:8001/v1/t5-cache`，将返回文件写入本次 `/dev/shm`
+  工作目录，再构造底层任务。调用仍由 runtime lock 和单任务 Backend
+  串行化；普通输入/输出契约失败恢复 READY，CUDA/模型异常进入 ERROR 并由
+  外部重启 worker。

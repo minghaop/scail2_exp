@@ -7,8 +7,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from scail2_inference.conditioning import NEGATIVE_CONTEXT, TEXT_CONTEXT
-from scail2_inference.contracts import ProductionProfile
+from scail2_single_gpu_runtime.conditioning import NEGATIVE_CONTEXT, TEXT_CONTEXT
+from scail2_single_gpu_runtime.contracts import ProductionProfile
 
 
 class T5PrecacheEngine:

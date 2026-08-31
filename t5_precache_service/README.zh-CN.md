@@ -3,7 +3,7 @@
 ## 1. 服务用途
 
 T5 Precache 服务常驻加载 T5 Encoder，根据输入 prompt 生成可直接交给
-`scail2_inference` 使用的 `.safetensors` 缓存文件。
+`scail2_single_gpu_runtime` 使用的 `.safetensors` 缓存文件。
 
 服务内部以规范化 prompt 的 SHA-256 作为文件索引：
 
@@ -49,7 +49,8 @@ t5_precache_service/
 `work/` 已加入该子工程自己的 `.gitignore`。未显式传入 `--cache-dir` 时，
 服务默认使用 `t5_precache_service/work/cache`。
 
-缓存格式的共享读写和校验代码位于 `scail2_inference/conditioning.py`，主推理与
+缓存格式的共享读写和校验代码位于
+`scail2_single_gpu_runtime/conditioning.py`，主推理与
 本服务共同使用该实现。
 
 ## 4. 启动服务
@@ -170,7 +171,7 @@ t5_precache_service/work/cache/95/95cf...e1ab0.safetensors
 
 ## 8. 交给主推理流程
 
-下载得到的文件可以直接作为 `scail2_inference` 推理任务的
+下载得到的文件可以直接作为 `scail2_single_gpu_runtime` 推理任务的
 `t5_cache_path`，无需再加载 T5：
 
 ```python

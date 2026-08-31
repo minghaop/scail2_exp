@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping
 
-from scail2_inference.conditioning import (
+from scail2_single_gpu_runtime.conditioning import (
     NEGATIVE_CONTEXT,
     TEXT_CONTEXT,
     build_t5_metadata,
@@ -69,7 +69,7 @@ class T5CacheDatabase:
         return self.root / prompt_hash[:2] / f"{prompt_hash}.safetensors"
 
     def _expected_metadata(self, prompt_hash: str) -> dict[str, str]:
-        from scail2_inference.conditioning import expected_t5_metadata
+        from scail2_single_gpu_runtime.conditioning import expected_t5_metadata
 
         expected = expected_t5_metadata(
             profile=self.profile,

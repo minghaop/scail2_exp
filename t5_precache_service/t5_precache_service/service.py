@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from scail2_inference.contracts import ProductionProfile
+from scail2_single_gpu_runtime.contracts import ProductionProfile
 from t5_precache_service.database import (
     T5CacheDatabase,
     T5CacheRecord,
