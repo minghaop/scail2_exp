@@ -3,3 +3,4 @@ __pycache__/
 experiment_logs/
 experiment_outputs/
 experiment_cache/
+testdata/
