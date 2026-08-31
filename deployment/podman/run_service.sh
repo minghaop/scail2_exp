@@ -4,8 +4,7 @@ set -euo pipefail
 : "${SCAIL2_MODEL_DIR:?Set SCAIL2_MODEL_DIR to the host model directory}"
 : "${SCAIL2_INPUT_DIR:?Set SCAIL2_INPUT_DIR to the host input directory}"
 : "${SCAIL2_OUTPUT_DIR:?Set SCAIL2_OUTPUT_DIR to the host output directory}"
-: "${SCAIL2_GPU_0:?Set SCAIL2_GPU_0 to the first host GPU index}"
-: "${SCAIL2_GPU_1:?Set SCAIL2_GPU_1 to the second host GPU index}"
+: "${SCAIL2_GPU:?Set SCAIL2_GPU to the host GPU index}"
 
 SCAIL2_IMAGE=${SCAIL2_IMAGE:-localhost/scail2-inference:0.1.3}
 SCAIL2_CONTAINER_NAME=${SCAIL2_CONTAINER_NAME:-scail2-worker-013}
@@ -28,8 +27,7 @@ podman run --detach \
   --restart unless-stopped \
   --ipc host \
   --publish "${SCAIL2_HTTP_BIND_ADDRESS}:${SCAIL2_HTTP_PORT}:8000" \
-  --device "nvidia.com/gpu=$SCAIL2_GPU_0" \
-  --device "nvidia.com/gpu=$SCAIL2_GPU_1" \
+  --device "nvidia.com/gpu=$SCAIL2_GPU" \
   --volume "$SCAIL2_MODEL_DIR":/models:ro \
   --volume "$SCAIL2_INPUT_DIR":/inputs:ro \
   --volume "$SCAIL2_OUTPUT_DIR":/outputs \

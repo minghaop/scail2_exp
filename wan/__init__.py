@@ -1,2 +1,2 @@
-from . import configs, distributed, modules
+from . import configs, modules
 from .scail import SCAIL2Pipeline

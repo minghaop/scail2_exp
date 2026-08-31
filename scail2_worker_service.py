@@ -23,8 +23,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 
-# Deployment and model configuration is deliberately kept in code.  torchrun's
-# RANK/WORLD_SIZE environment variables are still consumed by the SDK itself.
+# Deployment and model configuration is deliberately kept in code.
 LISTEN_HOST = "0.0.0.0"
 DEFAULT_PORT = 3000
 WORKFLOW = "scail2_video"
@@ -35,7 +34,6 @@ DIT_CHECKPOINT = Path(
     "SCAIL-2-lightx2v-r128-dpo-alpha1-full-bf16.safetensors"
 )
 PROFILE_NAME = "scail2-512p-bf16-v1"
-EXPECTED_WORLD_SIZE = 1
 OUTPUT_AUDIO_MODE = "driving"
 
 DOWNLOAD_TIMEOUT_SECONDS = 300.0
@@ -44,9 +42,6 @@ INFERENCE_TIMEOUT_SECONDS = 7200.0
 STARTUP_TIMEOUT_SECONDS = 1800.0
 SHUTDOWN_TIMEOUT_SECONDS = 600.0
 COMPUTING_EVENT_INTERVAL_SECONDS = 30.0
-
-CONTROL_POLL_SECONDS = 1.0
-CONTROL_TIMEOUT_SECONDS = 120.0
 
 PATH_PARAM_FIELDS = (
     "reference_image",
@@ -771,9 +766,8 @@ class DispatcherWorkerService:
                 )
             except Exception:
                 pass
-        # A timed-out distributed CUDA/NCCL call cannot be safely cancelled or
-        # reused.  Exiting rank 0 makes torchrun stop rank 1; Podman then restarts
-        # the complete worker.  os._exit is intentional because a hung runtime
+        # A timed-out CUDA call cannot be safely cancelled or reused. Podman
+        # restarts the worker. os._exit is intentional because a hung runtime
         # thread would prevent a normal Python shutdown.
         os._exit(1)
 
@@ -805,15 +799,6 @@ def positive_port(value: str) -> int:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=positive_port, default=DEFAULT_PORT)
-    # Some torchrun versions pass this argument while newer SDK code generally
-    # reads LOCAL_RANK from the environment.  Accept both spellings harmlessly.
-    parser.add_argument(
-        "--local-rank",
-        "--local_rank",
-        type=int,
-        default=None,
-        help=argparse.SUPPRESS,
-    )
     return parser.parse_args()
 
 
@@ -830,7 +815,7 @@ def main() -> None:
             EngineConfig,
             InferenceJob,
             ProductionProfile,
-            Scail2DistributedRuntime,
+            Scail2Runtime,
             Scail2InferenceEngine,
             __version__,
         )
@@ -844,31 +829,9 @@ def main() -> None:
         checkpoint_dir=CHECKPOINT_DIR,
         scail_checkpoint=DIT_CHECKPOINT,
         profile=profile,
-        expected_world_size=EXPECTED_WORLD_SIZE,
-        initialize_process_group=False,
-        t5_fsdp=False,
-        dit_fsdp=False,
-        dit_meta_load=True,
-        dit_init_on_cpu=False,
-        keep_dit_cpu_state_dict=True,
-        vae_dit_offload_blocks=7,
-        offload_vae_during_dit=True,
-        precomputed_conditioning=True,
-        online_clip_conditioning=True,
-        offload_model=False,
         output_audio_mode=OUTPUT_AUDIO_MODE,
     )
-    runtime = Scail2DistributedRuntime(
-        Scail2InferenceEngine(config),
-        control_poll_seconds=CONTROL_POLL_SECONDS,
-        control_timeout_seconds=CONTROL_TIMEOUT_SECONDS,
-    )
-
-    if not runtime.engine.is_primary:
-        runtime.run(None)
-        if runtime.failure is not None:
-            raise RuntimeError("SCAIL-2 non-primary runtime failed") from runtime.failure
-        return
+    runtime = Scail2Runtime(Scail2InferenceEngine(config))
 
     backend = DispatcherJobBackend()
 
@@ -922,7 +885,7 @@ def main() -> None:
     ).start()
 
     print(
-        f"SCAIL2_DISPATCHER_WORKER_READY rank=0 host={LISTEN_HOST} "
+        f"SCAIL2_DISPATCHER_WORKER_READY host={LISTEN_HOST} "
         f"port={args.port} workflow={WORKFLOW}",
         flush=True,
     )

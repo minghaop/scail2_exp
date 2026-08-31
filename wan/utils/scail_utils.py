@@ -4,7 +4,6 @@ import numpy as np
 from decord import VideoReader
 import torch
 import torch.nn.functional as F
-import logging
 
 from PIL import Image
 import torchvision.transforms as TT
@@ -27,8 +26,8 @@ def load_video_for_pose_sample(video_data, image_size=None, batch_size=None):
     """Decode a video, optionally resizing it in bounded-memory frame batches.
 
     The legacy path decoded every source-resolution frame at once and only then
-    resized the full tensor. A long 4K video can require tens of gigabytes per
-    FSDP rank before the resize. Supplying ``image_size`` preserves the same
+    resized the full tensor. A long 4K video can require tens of gigabytes.
+    Supplying ``image_size`` preserves the same
     per-frame bicubic center crop while retaining only a small source-resolution
     batch and one uint8 target-resolution tensor in memory.
     """
@@ -185,12 +184,6 @@ def extract_and_compress_mask_to_latent(mask_cthw, additional_spatial_downsample
         R * G * B, R * nG * nB, nR * G * nB, nR * nG * B,
         R * G * nB, R * nG * B, nR * G * B,
     ], dim=1)  # (T, 7, H, W)
-    _color_names = ['white', 'red', 'green', 'blue', 'yellow', 'magenta', 'cyan']
-    _total = H * W * T
-    for _i, _name in enumerate(_color_names):
-        _ratio = binary_7ch[:, _i].sum().item() / _total
-        if _ratio > 0.001:
-            logging.info(f"  [mask debug] ch{_i} {_name}: {_ratio:.4f} ({_ratio*100:.2f}%)")
     H_lat, W_lat = H, W
     if additional_spatial_downsample > 1:
         H_lat = H_lat // additional_spatial_downsample

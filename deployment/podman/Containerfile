@@ -1,4 +1,4 @@
-# Reference build for one persistent two-GPU SCAIL-2 worker. Production should
+# Reference build for one persistent single-GPU SCAIL-2 worker. Production should
 # mirror every artifact internally and pin the CUDA base by registry digest.
 ARG BASE_IMAGE=docker.io/nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04
 FROM ${BASE_IMAGE}
@@ -6,10 +6,7 @@ FROM ${BASE_IMAGE}
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     TOKENIZERS_PARALLELISM=false \
-    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
-    NCCL_IB_DISABLE=1 \
-    NCCL_DEBUG=WARN
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 RUN apt-get -o APT::Sandbox::User=root update \
     && apt-get -o APT::Sandbox::User=root install -y --no-install-recommends \
@@ -44,21 +41,17 @@ RUN python3.10 -m pip install --no-cache-dir --no-deps /opt/scail2/${SCAIL2_WHEE
     && python3.10 /opt/scail2/verify_pip_check.py
 
 # The deployment service supplies its own module here. One container represents
-# one torchrun worker and must see exactly two GPUs.
+# one worker process and must see exactly one GPU.
 COPY examples/scail2_worker_service.py /opt/scail2/scail2_worker_service.py
 COPY examples/scail2_fastapi_service.py /opt/scail2/scail2_fastapi_service.py
-COPY deployment/podman/nccl_smoke.py /opt/scail2/nccl_smoke.py
 ARG WORKER_MODULE=scail2_fastapi_service
 ENV SCAIL2_WORKER_MODULE=${WORKER_MODULE} \
-    TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=1800 \
     SCAIL2_INPUT_DIR=/inputs \
     SCAIL2_OUTPUT_DIR=/outputs \
     SCAIL2_HTTP_HOST=0.0.0.0 \
     SCAIL2_HTTP_PORT=8000 \
     SCAIL2_OUTPUT_AUDIO_MODE=driving \
-    SCAIL2_MAX_QUEUE_SIZE=8 \
-    SCAIL2_CONTROL_HEARTBEAT_SECONDS=1 \
-    SCAIL2_CONTROL_TIMEOUT_SECONDS=120
+    SCAIL2_MAX_QUEUE_SIZE=8
 EXPOSE 8000
 ENTRYPOINT ["/bin/bash", "-lc"]
-CMD ["scail2-runtime-info --expected-gpu-count 2 && exec torchrun --standalone --nproc_per_node=2 -m ${SCAIL2_WORKER_MODULE}"]
+CMD ["scail2-runtime-info --expected-gpu-count 1 && exec python3.10 -m ${SCAIL2_WORKER_MODULE}"]

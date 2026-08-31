@@ -479,7 +479,6 @@ class T5EncoderModel:
         device=torch.cuda.current_device(),
         checkpoint_path=None,
         tokenizer_path=None,
-        shard_fn=None,
         meta_load=False,
         init_event=None,
     ):
@@ -555,25 +554,14 @@ class T5EncoderModel:
                     "T5 checkpoint assignment left meta tensors: " + examples
                 )
         self.model = model
-        if shard_fn is not None:
-            fsdp_started = time.monotonic()
-            emit("t5_fsdp_wrap", "start", sync_module_states=False)
-            self.model = shard_fn(self.model, sync_module_states=False)
-            emit(
-                "t5_fsdp_wrap",
-                "complete",
-                started_at=fsdp_started,
-                sync_module_states=False,
-            )
-        else:
-            placement_started = time.monotonic()
-            emit("t5_device_placement", "start")
-            self.model.to(self.device)
-            emit(
-                "t5_device_placement",
-                "complete",
-                started_at=placement_started,
-            )
+        placement_started = time.monotonic()
+        emit("t5_device_placement", "start")
+        self.model.to(self.device)
+        emit(
+            "t5_device_placement",
+            "complete",
+            started_at=placement_started,
+        )
         # init tokenizer
         tokenizer_started = time.monotonic()
         emit("t5_tokenizer_load", "start")

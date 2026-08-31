@@ -15,7 +15,7 @@ from .errors import (
     OutputValidationError,
     Scail2InferenceError,
 )
-from .runtime import JobBackend, Scail2DistributedRuntime
+from .runtime import JobBackend, Scail2Runtime
 
 __all__ = [
     "EngineConfig",
@@ -28,7 +28,7 @@ __all__ = [
     "JobBackend",
     "OutputValidationError",
     "ProductionProfile",
-    "Scail2DistributedRuntime",
+    "Scail2Runtime",
     "Scail2InferenceEngine",
     "Scail2InferenceError",
 ]

@@ -1,7 +1,7 @@
 Metadata-Version: 2.4
 Name: scail2-inference
 Version: 0.1.3
-Summary: Persistent BF16 SCAIL-2 inference engine and distributed worker runtime
+Summary: Persistent single-GPU BF16 SCAIL-2 inference runtime
 License: Apache-2.0
 Requires-Python: <3.11,>=3.10
 Description-Content-Type: text/markdown
@@ -173,7 +173,6 @@ SCAIL-2/
 ├── Wan2.1_VAE.pth
 ├── model
 │   ├── 1
-│   │   └── fsdp2_rank_0000_checkpoint.pt
 │   └── latest
 └── umt5-xxl
     ├── ...

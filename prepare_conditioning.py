@@ -13,7 +13,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from run_fsdp_experiment import (
+from experiment_support import (
     CHECKPOINT_DIR,
     CONDA_ENV,
     DEFAULT_PROMPT,
@@ -141,7 +141,6 @@ def run_worker(args: argparse.Namespace) -> None:
     cfg = SCAIL_CONFIGS[profile.model.upper()]
     t5_checkpoint = CHECKPOINT_DIR / cfg.t5_checkpoint
 
-    torch.cuda.reset_peak_memory_stats(device)
     stage_started = time.monotonic()
     print("SCAIL2_PREPROCESS stage=t5 status=start", flush=True)
     text_encoder = T5EncoderModel(
@@ -150,17 +149,14 @@ def run_worker(args: argparse.Namespace) -> None:
         device=device,
         checkpoint_path=str(t5_checkpoint),
         tokenizer_path=str(CHECKPOINT_DIR / cfg.t5_tokenizer),
-        shard_fn=None,
         meta_load=True,
     )
     with torch.inference_mode():
         text_context = text_encoder([args.prompt], device)[0].detach().cpu().contiguous()
         negative_context = text_encoder([args.negative_prompt], device)[0].detach().cpu().contiguous()
-    torch.cuda.synchronize(device)
     print(
         "SCAIL2_PREPROCESS stage=t5 status=complete "
         f"elapsed_seconds={time.monotonic() - stage_started:.3f} "
-        f"peak_allocated_mib={torch.cuda.max_memory_allocated(device) / 2**20:.1f} "
         f"text_shape={tuple(text_context.shape)} "
         f"negative_shape={tuple(negative_context.shape)}",
         flush=True,

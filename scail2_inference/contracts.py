@@ -104,82 +104,13 @@ class EngineConfig:
     scail_checkpoint: Path
     scail_config_path: Path | None = None
     profile: ProductionProfile = field(default_factory=ProductionProfile)
-    expected_world_size: int | None = 1
-    distributed_backend: str = "nccl"
-    initialize_process_group: bool = False
-    t5_fsdp: bool = False
-    t5_meta_load: bool = False
-    dit_fsdp: bool = False
-    cast_dit_forward_inputs: bool = False
-    dit_meta_load: bool = True
-    dit_init_on_cpu: bool = False
-    keep_dit_cpu_state_dict: bool = True
-    vae_dit_offload_blocks: int = 7
-    offload_vae_during_dit: bool = True
-    precomputed_conditioning: bool = True
-    online_clip_conditioning: bool = True
-    t5_cpu: bool = False
-    offload_model: bool = False
     output_audio_mode: str = "none"
 
     def validate(self, *, check_paths: bool = True) -> None:
         self.profile.validate()
-        if self.expected_world_size is not None and self.expected_world_size <= 0:
-            raise EnvironmentValidationError("expected_world_size must be positive")
-        if self.distributed_backend != "nccl":
-            raise EnvironmentValidationError(
-                "The production runtime currently supports only the NCCL backend"
-            )
-        if self.t5_cpu and self.t5_fsdp:
-            raise EnvironmentValidationError("t5_cpu and t5_fsdp are mutually exclusive")
-        if self.precomputed_conditioning and self.t5_fsdp:
-            raise EnvironmentValidationError(
-                "precomputed_conditioning requires t5_fsdp=False"
-            )
-        if not self.precomputed_conditioning:
-            raise EnvironmentValidationError(
-                "The inference interface requires a precomputed T5 cache"
-            )
-        if self.online_clip_conditioning and not self.precomputed_conditioning:
-            raise EnvironmentValidationError(
-                "online_clip_conditioning requires precomputed_conditioning=True"
-            )
-        if self.precomputed_conditioning and not self.online_clip_conditioning:
-            raise EnvironmentValidationError(
-                "The T5-cache interface requires online_clip_conditioning=True"
-            )
-        if self.offload_model:
-            raise EnvironmentValidationError(
-                "The persistent worker contract requires offload_model=False"
-            )
         if self.output_audio_mode not in {"none", "driving"}:
             raise EnvironmentValidationError(
                 "output_audio_mode must be either 'none' or 'driving'"
-            )
-        if self.expected_world_size == 1 and (self.t5_fsdp or self.dit_fsdp):
-            raise EnvironmentValidationError(
-                "FSDP requires a distributed world size greater than one"
-            )
-        if self.keep_dit_cpu_state_dict and self.dit_fsdp:
-            raise EnvironmentValidationError(
-                "Retaining a DiT CPU master is currently supported only "
-                "without FSDP"
-            )
-        if not 0 <= self.vae_dit_offload_blocks <= 40:
-            raise EnvironmentValidationError(
-                "vae_dit_offload_blocks must be between 0 and 40"
-            )
-        if self.vae_dit_offload_blocks and (
-            self.dit_fsdp or not self.keep_dit_cpu_state_dict
-        ):
-            raise EnvironmentValidationError(
-                "VAE-phase DiT block offload requires a non-FSDP DiT and "
-                "keep_dit_cpu_state_dict=True"
-            )
-        if self.offload_vae_during_dit and self.expected_world_size != 1:
-            raise EnvironmentValidationError(
-                "VAE CPU residency during DiT is currently supported only "
-                "for explicit single-GPU configurations"
             )
         if check_paths:
             for label, path, require_directory in (

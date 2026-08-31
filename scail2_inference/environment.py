@@ -171,7 +171,7 @@ def validate_environment(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Inspect the SCAIL-2 runtime")
-    parser.add_argument("--expected-gpu-count", type=int, default=2)
+    parser.add_argument("--expected-gpu-count", type=int, default=1)
     parser.add_argument(
         "--allow-no-cuda",
         action="store_true",
