@@ -942,10 +942,9 @@ def main() -> None:
         daemon=True,
     ).start()
 
-    print(
+    logging.info(
         f"SCAIL2_DISPATCHER_WORKER_READY host={LISTEN_HOST} "
-        f"port={args.port} workflow={WORKFLOW}",
-        flush=True,
+        f"port={args.port} workflow={WORKFLOW}"
     )
     try:
         server.run()

@@ -74,7 +74,7 @@ def _emit_pipeline_init_event(stage, status, started_at=None, **details):
     if started_at is not None:
         fields.append(f"elapsed_seconds={time.monotonic() - started_at:.3f}")
     fields.extend(f"{key}={value}" for key, value in details.items())
-    print(" ".join(fields), file=sys.stderr, flush=True)
+    logging.info("%s", " ".join(fields))
 
 
 def resolve_dit_resident_dtype(value):

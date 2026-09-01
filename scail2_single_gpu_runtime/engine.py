@@ -6,7 +6,6 @@ import ctypes
 import gc
 import logging
 import os
-import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -68,7 +67,7 @@ class Scail2InferenceEngine:
         *,
         elapsed_seconds: float | None = None,
     ) -> None:
-        """Emit one startup event without polluting JSONL stdout."""
+        """Emit one startup event through the service logger."""
         fields = [
             "SCAIL2_INIT",
             f"device={self.device_id}",
@@ -77,10 +76,11 @@ class Scail2InferenceEngine:
         ]
         if elapsed_seconds is not None:
             fields.append(f"elapsed_seconds={elapsed_seconds:.3f}")
-        print(" ".join(fields), file=sys.stderr, flush=True)
+        logging.info("%s", " ".join(fields))
 
     def _emit_ready_event(self) -> None:
-        print(
+        logging.info(
+            "%s",
             " ".join(
                 [
                     "SCAIL2_WORKER_READY",
@@ -89,8 +89,6 @@ class Scail2InferenceEngine:
                     f"resident_dtype={self.config.profile.resident_dtype}",
                 ]
             ),
-            file=sys.stderr,
-            flush=True,
         )
 
     def _configure_process(self) -> None:
